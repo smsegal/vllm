@@ -123,7 +123,7 @@ class SpecDecodeBaseSampler(nn.Module):
         # Determine the index of the first False value for each row.
         limits = (accepted == 0).max(1).indices
         limits[~(accepted == 0).any(1)] = k
-
+        self.acceptance_lengths = limits.detach().cpu()
         # Create masks using the indices.
         indices = torch.arange(k, device=accepted.device).unsqueeze(0)
         accepted_mask = indices < limits.unsqueeze(1)
@@ -156,19 +156,6 @@ class SpecDecodeBaseSampler(nn.Module):
         )
 
         if request_ids is not None:
-            # Vectorized calculation of accept_len for entire batch
-            # Calculate consecutive accepted tokens for all sequences at once
-            cumsum_vals = accepted.cumsum(dim=1)  # [batch_size, k]
-            positions = torch.arange(
-                1, k + 1, device=accepted.device
-            ).unsqueeze(0)  # [1, k]
-            # Where cumsum equals position index, we have consecutive 1s from start
-            consecutive_ones = (
-                cumsum_vals == positions
-            ).int()  # [batch_size, k]
-            # Sum along sequence dimension gives count of consecutive 1s from start for each batch item
-            accept_lens = consecutive_ones.sum(dim=1)  # [batch_size]
-
             for i, request_id in enumerate(request_ids):
                 if request_id not in self.request_metrics:
                     self.request_metrics[request_id] = {
