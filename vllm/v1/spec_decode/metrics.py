@@ -30,8 +30,10 @@ class SpecDecodingStats:
 
     @classmethod
     def new(cls, num_spec_tokens: int) -> "SpecDecodingStats":
-        return cls(num_spec_tokens=num_spec_tokens,
-                   num_accepted_tokens_per_pos=[0] * num_spec_tokens)
+        return cls(
+            num_spec_tokens=num_spec_tokens,
+            num_accepted_tokens_per_pos=[0] * num_spec_tokens,
+        )
 
     def observe_draft(self, num_draft_tokens: int, num_accepted_tokens: int):
         self.num_drafts += 1
@@ -62,27 +64,28 @@ class SpecDecodingLogging:
     def observe(self, spec_decoding_stats: SpecDecodingStats):
         self.num_drafts.append(spec_decoding_stats.num_drafts)
         self.num_draft_tokens.append(spec_decoding_stats.num_draft_tokens)
-        self.num_accepted_tokens.append(
-            spec_decoding_stats.num_accepted_tokens)
+        self.num_accepted_tokens.append(spec_decoding_stats.num_accepted_tokens)
         self.accepted_tokens_per_pos_lists.append(
-            spec_decoding_stats.num_accepted_tokens_per_pos)
+            spec_decoding_stats.num_accepted_tokens_per_pos
+        )
 
     def log(self, log_fn=logger.info):
-        if not self.num_drafts:
-            return
         num_drafts = np.sum(self.num_drafts)
         num_draft_tokens = np.sum(self.num_draft_tokens)
         num_accepted_tokens = np.sum(self.num_accepted_tokens)
 
-        draft_acceptance_rate = (num_accepted_tokens / num_draft_tokens *
-                                 100 if num_draft_tokens > 0 else float("nan"))
+        draft_acceptance_rate = (
+            num_accepted_tokens / num_draft_tokens * 100
+            if num_draft_tokens > 0
+            else float("nan")
+        )
+
+        pos_matrix = np.array(self.accepted_tokens_per_pos_lists)
+        acceptance_probs = np.sum(pos_matrix, axis=0) / num_drafts
+        probs_str = ", ".join(f"{p:.3f}" for p in acceptance_probs)
 
         # Conventionally, mean acceptance length includes the bonus token
         mean_acceptance_length = 1 + (num_accepted_tokens / num_drafts)
-
-        pos_matrix = np.array(self.accepted_tokens_per_pos_lists)
-        acceptance_rates = np.sum(pos_matrix, axis=0) / num_drafts
-        rates_str = ", ".join(f"{p:.3f}" for p in acceptance_rates)
 
         log_fn(
             "SpecDecoding metrics: "
@@ -91,11 +94,12 @@ class SpecDecodingLogging:
             "Accepted: %d tokens, "
             "Drafted: %d tokens, "
             "Per-position acceptance rate: %s",
+            "Per-position acceptance probabilities: %s",
             draft_acceptance_rate,
             mean_acceptance_length,
             num_accepted_tokens,
             num_draft_tokens,
-            rates_str,
+            probs_str,
         )
         self.reset()
 
@@ -133,25 +137,28 @@ class SpecDecodingProm:
         if not self.spec_decoding_enabled:
             return
 
-        self.counter_spec_decode_num_drafts = \
-            self._counter_cls(
-                name="vllm:spec_decode_num_drafts",
-                documentation="Number of spec decoding drafts.",
-                labelnames=labelnames).labels(*labelvalues)
-        self.counter_spec_decode_num_draft_tokens = \
-            self._counter_cls(
-                name="vllm:spec_decode_num_draft_tokens",
-                documentation="Number of draft tokens.",
-                labelnames=labelnames,).labels(*labelvalues)
-        self.counter_spec_decode_num_accepted_tokens = \
-            self._counter_cls(
-                name="vllm:spec_decode_num_accepted_tokens",
-                documentation="Number of accepted tokens.",
-                labelnames=labelnames).labels(*labelvalues)
+        self.counter_spec_decode_num_drafts = self._counter_cls(
+            name="vllm:spec_decode_num_drafts_total",
+            documentation="Number of spec decoding drafts.",
+            labelnames=labelnames,
+        ).labels(*labelvalues)
+        self.counter_spec_decode_num_draft_tokens = self._counter_cls(
+            name="vllm:spec_decode_num_draft_tokens_total",
+            documentation="Number of draft tokens.",
+            labelnames=labelnames,
+        ).labels(*labelvalues)
+        self.counter_spec_decode_num_accepted_tokens = self._counter_cls(
+            name="vllm:spec_decode_num_accepted_tokens_total",
+            documentation="Number of accepted tokens.",
+            labelnames=labelnames,
+        ).labels(*labelvalues)
 
         assert speculative_config is not None
-        num_spec_tokens = (speculative_config.num_speculative_tokens
-                           if self.spec_decoding_enabled else 0)
+        num_spec_tokens = (
+            speculative_config.num_speculative_tokens
+            if self.spec_decoding_enabled
+            else 0
+        )
         pos_labelnames = labelnames + ["position"]
         base_counter = self._counter_cls(
             name="vllm:spec_decode_num_accepted_tokens_per_pos",
@@ -159,20 +166,25 @@ class SpecDecodingProm:
             labelnames=pos_labelnames,
         )
         self.counter_spec_decode_num_accepted_tokens_per_pos: list[
-            prometheus_client.Counter] = []
+            prometheus_client.Counter
+        ] = []
         for pos in range(num_spec_tokens):
             pos_labelvalues = labelvalues + [str(pos)]
             self.counter_spec_decode_num_accepted_tokens_per_pos.append(
-                base_counter.labels(*pos_labelvalues))
+                base_counter.labels(*pos_labelvalues)
+            )
 
     def observe(self, spec_decoding_stats: SpecDecodingStats):
         if not self.spec_decoding_enabled:
             return
         self.counter_spec_decode_num_drafts.inc(spec_decoding_stats.num_drafts)
         self.counter_spec_decode_num_draft_tokens.inc(
-            spec_decoding_stats.num_draft_tokens)
+            spec_decoding_stats.num_draft_tokens
+        )
         self.counter_spec_decode_num_accepted_tokens.inc(
-            spec_decoding_stats.num_accepted_tokens)
+            spec_decoding_stats.num_accepted_tokens
+        )
         for pos, counter in enumerate(
-                self.counter_spec_decode_num_accepted_tokens_per_pos):
+            self.counter_spec_decode_num_accepted_tokens_per_pos
+        ):
             counter.inc(spec_decoding_stats.num_accepted_tokens_per_pos[pos])
