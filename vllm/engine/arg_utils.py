@@ -1698,16 +1698,7 @@ class EngineArgs:
             )
             return False
 
-        # V1 supports N-gram, Medusa, and Eagle speculative decoding.
-        if (
-            self.speculative_config is not None
-            and self.speculative_config.get("method") == "draft_model"
-        ):
-            raise NotImplementedError(
-                "Speculative decoding with draft model is not supported yet. "
-                "Please consider using other speculative decoding methods "
-                "such as ngram, medusa, eagle, or deepseek_mtp."
-            )
+        # V1 supports N-gram, Medusa, Draft, and Eagle speculative decoding.
 
         V1_BACKENDS = [
             "FLASH_ATTN_VLLM_V1",
@@ -2067,10 +2058,9 @@ class AsyncEngineArgs(EngineArgs):
 
 
 def _raise_or_fallback(feature_name: str, recommend_to_remove: bool):
-    if envs.is_set("VLLM_USE_V1") and envs.VLLM_USE_V1:
-        raise NotImplementedError(
-            f"VLLM_USE_V1=1 is not supported with {feature_name}."
-        )
+    # if envs.is_set("VLLM_USE_V1") and envs.VLLM_USE_V1:
+    #     raise NotImplementedError(
+    #         f"VLLM_USE_V1=1 is not supported with {feature_name}.")
     msg = f"{feature_name} is not supported by the V1 Engine. "
     msg += "Falling back to V0. "
     if recommend_to_remove:

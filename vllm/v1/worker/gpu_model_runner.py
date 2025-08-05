@@ -113,6 +113,7 @@ from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -251,6 +252,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             elif self.speculative_config.method == "medusa":
                 self.drafter = MedusaProposer(
                     vllm_config=self.vllm_config, device=self.device
+                )  # type: ignore
+            elif self.speculative_config.method == "draft_model":
+                self.drafter = DraftModelProposer(
+                    vllm_config=self.vllm_config,
+                    device=self.device,
+                    runner=self,
                 )  # type: ignore
             else:
                 raise ValueError(
@@ -2011,6 +2018,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 spec_decode_metadata,
                 spec_decode_common_attn_metadata,
             )
+            logger.info(f"DRAFTED {spec_token_ids} ... ")
 
         self.eplb_step()
 
@@ -2073,6 +2081,38 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 target_hidden_states=hidden_states,
                 sampling_metadata=sampling_metadata,
             )
+        elif self.speculative_config.method == "draft_model":
+            assert isinstance(self.drafter, DraftModelProposer)
+            # Reconstruct full sequences for the draft model similar to EAGLE.
+            if spec_decode_metadata is None:
+                target_token_ids = self.input_ids[:num_scheduled_tokens]
+                target_positions = self.positions[:num_scheduled_tokens]
+                spec_common_attn_metadata = common_attn_metadata
+            else:
+                num_draft_tokens = spec_decode_metadata.num_draft_tokens
+                num_rejected_tokens = [
+                    n + 1 - len(sampled_token_ids[i]) if n > 0 else 0
+                    for i, n in enumerate(num_draft_tokens)
+                ]
+                num_rejected_tokens_cpu = torch.tensor(
+                    num_rejected_tokens, dtype=torch.int32
+                )
+                spec_common_attn_metadata, token_indices = (
+                    self.drafter.prepare_inputs(
+                        common_attn_metadata, num_rejected_tokens_cpu
+                    )
+                )
+
+                target_token_ids = self.input_ids[token_indices]
+                target_positions = self.positions[token_indices]
+
+            draft_token_ids = self.drafter.propose(
+                target_token_ids=target_token_ids,
+                target_positions=target_positions,
+                common_attn_metadata=spec_common_attn_metadata,
+                sampling_metadata=sampling_metadata,
+            )
+            spec_token_ids = draft_token_ids.tolist()
         elif self.speculative_config.use_eagle():
             assert isinstance(self.drafter, EagleProposer)
             # TODO(woosuk): Refactor the loop.
@@ -2256,7 +2296,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 )
             if hasattr(self, "drafter"):
                 logger.info("Loading drafter model...")
-                self.drafter.load_model(self.model)
+                if self.speculative_config.method == "draft_model":
+                    self.drafter.load_model()
+                else:
+                    self.drafter.load_model(self.model)
             if self.use_aux_hidden_state_outputs:
                 if supports_eagle3(self.model):
                     self.model.set_aux_hidden_state_layers(
