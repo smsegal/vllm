@@ -1,22 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
-from typing import TYPE_CHECKING
-
-from vllm.forward_context import set_forward_context
-from vllm.model_executor.model_loader import get_model
-
-from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.attention.backends.utils import CommonAttentionMetadata
-from vllm.v1.sample.sampler import Sampler
 from dataclasses import replace
+from typing import TYPE_CHECKING, Any
 
-import torch
 import numpy as np
+import torch
 
-from vllm.logger import init_logger
 from vllm.config import CompilationLevel, VllmConfig
+from vllm.forward_context import set_forward_context
+from vllm.logger import init_logger
+from vllm.model_executor.model_loader import get_model
 from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE, is_pin_memory_available
+from vllm.v1.attention.backends.utils import CommonAttentionMetadata
+from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.sampler import Sampler
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -93,30 +91,71 @@ class DraftModelProposer:
 
         # Initialize sampler for speculative token generation
         self.sampler = Sampler()
+        # Placeholder for loaded draft model (set in load_model)
+        self.model: Any = None
 
     def propose(
         self,
         target_token_ids: torch.Tensor,
         target_positions: torch.Tensor,
+        next_token_ids: torch.Tensor,
         common_attn_metadata: CommonAttentionMetadata,
         sampling_metadata: SamplingMetadata,
     ) -> torch.Tensor:
-        # Number of tokens across the batch (flattened)
-        num_tokens = target_token_ids.shape[0]
-        # Indices of the last token for each request in the flattened view
-        last_token_indices = common_attn_metadata.query_start_loc[1:] - 1
+        # Base per-sequence boundaries
+        query_start = common_attn_metadata.query_start_loc
+        seq_starts = query_start[:-1]
+        seq_ends = query_start[1:]
+        batch_size = seq_starts.shape[0]
 
-        # Copy full sequence ids/positions into persistent buffers
-        self.input_ids[:num_tokens] = target_token_ids
-        self.positions[:num_tokens] = target_positions
+        # Helper: rebuild flattened tokens with interleaved speculative tokens
+        extra_tokens: list[list[int]] = [[] for _ in range(batch_size)]
 
-        # Pad for CUDA graphs if enabled and within captured size
-        if self.use_cuda_graph and num_tokens <= self.cudagraph_batch_sizes[-1]:
-            num_input_tokens = self.vllm_config.pad_for_cudagraph(num_tokens)
+        def rebuild() -> tuple[torch.Tensor, int]:
+            ptr = 0
+            last_indices_list = []
+            for i in range(batch_size):
+                s = int(seq_starts[i])
+                e = int(seq_ends[i])
+                length = e - s
+                base_slice = target_token_ids[s:e]
+                n_extra = len(extra_tokens[i])
+                total_len = length + n_extra
+                # Copy base tokens
+                self.input_ids[ptr : ptr + length] = base_slice
+                base_pos = target_positions[s:e]
+                self.positions[ptr : ptr + length] = base_pos
+                # Append speculative tokens & their positions
+                if n_extra:
+                    self.input_ids[ptr + length : ptr + total_len] = (
+                        torch.tensor(
+                            extra_tokens[i],
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+                    )
+                    last_pos = int(base_pos[length - 1]) if length > 0 else -1
+                    new_pos = torch.arange(
+                        last_pos + 1,
+                        last_pos + 1 + n_extra,
+                        device=self.device,
+                        dtype=torch.int64,
+                    )
+                    self.positions[ptr + length : ptr + total_len] = new_pos
+                last_indices_list.append(ptr + total_len - 1)
+                ptr += total_len
+            return torch.tensor(
+                last_indices_list, device=self.device, dtype=torch.int64
+            ), ptr
+
+        last_indices, total_tokens = rebuild()
+        if (
+            self.use_cuda_graph
+            and total_tokens <= self.cudagraph_batch_sizes[-1]
+        ):
+            num_input_tokens = self.vllm_config.pad_for_cudagraph(total_tokens)
         else:
-            num_input_tokens = num_tokens
-
-        # Run the draft model on the full sequence to get logits for the last tokens
+            num_input_tokens = total_tokens
         with set_forward_context(
             None, self.vllm_config, num_tokens=num_input_tokens
         ):
@@ -125,107 +164,55 @@ class DraftModelProposer:
                 positions=self.positions[:num_input_tokens],
                 inputs_embeds=None,
             )
+        hidden = ret[0] if isinstance(ret, tuple) else ret
+        # Pass None: logits processor only needs sampling metadata fields
+        logits_all = self.model.compute_logits(hidden, None)
+        current_logits = logits_all.index_select(0, last_indices)
 
-        # Assume the draft model forward returns logits; support tuple or tensor
-        if isinstance(ret, tuple):
-            logits_all = ret[0]
-        else:
-            logits_all = ret
-        assert isinstance(logits_all, torch.Tensor)
-
-        logits = logits_all[last_token_indices]
-
-        # Prepare a local sampling metadata with independent output_token_ids
         sampling_md = replace(
             sampling_metadata,
             output_token_ids=[
                 lst.copy() for lst in sampling_metadata.output_token_ids
             ],
         )
-
-        # If no speculative tokens are requested, return an empty tensor with correct shape
-        k = (
-            int(self.num_speculative_tokens)
-            if self.num_speculative_tokens is not None
-            else 0
-        )
-        batch_size = logits.shape[0]
+        k = int(self.num_speculative_tokens or 0)
         if k <= 0:
             return torch.empty(
-                (batch_size, 0), dtype=torch.int64, device=logits.device
+                (batch_size, 0), dtype=torch.int64, device=self.device
             )
 
-        draft_token_ids_list = []
-        # Track growing sequences - start with original sequences
-        current_num_tokens = num_tokens
-        current_logits = logits
-
-        # Generate all speculative tokens in unified loop
+        collected: list[torch.Tensor] = []
         for step in range(k):
-            # For steps after the first, append new tokens and run model forward pass
-            if step > 0:
-                # Append new tokens to the sequences
-                query_start_loc = common_attn_metadata.query_start_loc
-                # Vectorized append of new tokens/positions at the end of each sequence
-                per_req_offsets = (
-                    torch.arange(
-                        batch_size,
-                        device=query_start_loc.device,
-                        dtype=query_start_loc.dtype,
-                    )
-                    + 1
-                ) * step
-                seq_end_indices = query_start_loc[1:] - 1 + per_req_offsets
-                self.input_ids[seq_end_indices] = next_token_ids.to(torch.int32)
-                base_positions = target_positions[last_token_indices]
-                new_positions = base_positions + step
-                clamped_positions = torch.where(
-                    new_positions >= self.max_model_len,
-                    torch.zeros_like(new_positions),
-                    new_positions,
-                )
-                self.positions[seq_end_indices] = clamped_positions
-
-                current_num_tokens = num_tokens + step * batch_size
-
-                if (
-                    self.use_cuda_graph
-                    and current_num_tokens <= self.cudagraph_batch_sizes[-1]
-                ):
-                    input_num_tokens = self.vllm_config.pad_for_cudagraph(
-                        current_num_tokens
-                    )
-                else:
-                    input_num_tokens = current_num_tokens
-
-                with set_forward_context(
-                    None, self.vllm_config, num_tokens=input_num_tokens
-                ):
-                    ret = self.model(
-                        input_ids=self.input_ids[:input_num_tokens],
-                        positions=self.positions[:input_num_tokens],
-                        inputs_embeds=None,
-                    )
-
-                if isinstance(ret, tuple):
-                    logits_all_step = ret[0]
-                else:
-                    logits_all_step = ret
-
-                # Extract logits for the last token of each sequence
-                current_logits = logits_all_step[seq_end_indices]
-
             sampled = self.sampler(current_logits, sampling_md)
-            next_token_ids = sampled.sampled_token_ids.squeeze(-1).long()
-            # Update histories
-            next_token_list = next_token_ids.tolist()
-            for i, tok in enumerate(next_token_list):
+            step_tokens = sampled.sampled_token_ids.squeeze(-1).long()  # [B]
+            collected.append(step_tokens.view(-1, 1))
+            for i, tok in enumerate(step_tokens.tolist()):
                 sampling_md.output_token_ids[i].append(int(tok))
-
-            draft_token_ids_list.append(next_token_ids.view(-1, 1))
-
-        # [batch_size, num_speculative_tokens]
-        return torch.cat(draft_token_ids_list, dim=1)
+                extra_tokens[i].append(int(tok))
+            if step + 1 == k:
+                break
+            last_indices, total_tokens = rebuild()
+            if (
+                self.use_cuda_graph
+                and total_tokens <= self.cudagraph_batch_sizes[-1]
+            ):
+                num_input_tokens = self.vllm_config.pad_for_cudagraph(
+                    total_tokens
+                )
+            else:
+                num_input_tokens = total_tokens
+            with set_forward_context(
+                None, self.vllm_config, num_tokens=num_input_tokens
+            ):
+                ret = self.model(
+                    input_ids=self.input_ids[:num_input_tokens],
+                    positions=self.positions[:num_input_tokens],
+                    inputs_embeds=None,
+                )
+            hidden = ret[0] if isinstance(ret, tuple) else ret
+            logits_all = self.model.compute_logits(hidden, None)
+            current_logits = logits_all.index_select(0, last_indices)
+        return torch.cat(collected, dim=1)
 
     def prepare_inputs(
         self,
@@ -320,7 +307,7 @@ class DraftModelProposer:
                 vllm_config=vllm_config_seperate_forward_context,
                 model_config=self.draft_model_config,
             )
-            logger.info(f"LOADED DRAFT MODEL {self.draft_model_config.model}")
+            logger.info("LOADED DRAFT MODEL %s", self.draft_model_config.model)
 
     @torch.inference_mode()
     def dummy_run(self, num_tokens: int):

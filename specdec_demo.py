@@ -7,16 +7,64 @@ from vllm import LLM, SamplingParams
 import os
 
 
-def main():
-    # force v1 engine
-    os.environ["VLLM_USE_V1"] = "1"
-    # Configure sampling parameters
-    sampling_params = SamplingParams(
-        temperature=0.1, top_p=0.95, max_tokens=128
-    )
+def build_conversations() -> list[list[dict[str, str]]]:
+    """Return multiple conversations (each a list of chat messages).
 
-    # Initialize LLM with speculative decoding configuration
-    llm = LLM(
+    We use llm.generate with manually applied chat templates so that vLLM's
+    tokenizer injects the proper system/user/assistant tokens.
+    """
+    return [
+        [
+            {
+                "role": "user",
+                "content": (
+                    "How many B's are in the word 'blueberry'? Explain "
+                    "counting succinctly."
+                ),
+            }
+        ],
+        [
+            {
+                "role": "user",
+                "content": (
+                    "Explain the difference between a CPU and a GPU in one "
+                    "concise sentence."
+                ),
+            }
+        ],
+        [
+            {
+                "role": "user",
+                "content": (
+                    "Compute 12345 * 678. Show clear calculation steps then "
+                    "give the final answer."
+                ),
+            }
+        ],
+        # [
+        #     {
+        #         "role": "user",
+        #         "content": (
+        #             "Write a haiku about speculative decoding accelerating "
+        #             "generation."
+        #         ),
+        #     }
+        # ],
+        # [
+        #     {
+        #         "role": "user",
+        #         "content": (
+        #             "List three potential risks of AI systems and one "
+        #             "mitigation for each."
+        #         ),
+        #     }
+        # ],
+    ]
+
+
+def init_llm():
+    """Initialize and return the LLM with speculative decoding configuration."""
+    return LLM(
         model="meta-llama/Llama-3.1-8B-Instruct",
         tensor_parallel_size=1,
         enforce_eager=True,
@@ -27,24 +75,43 @@ def main():
         ),
     )
 
-    # Generate response
-    output = llm.chat(
-        messages=[
-            {
-                "role": "user",
-                "content": "How many B's in blueberry? Count using your fingers, no peeking!",
-            },
-        ],
-        sampling_params=sampling_params,
+
+def run_batch_chat(
+    llm: LLM,
+    sampling_params: SamplingParams,
+    conversations: list[list[dict[str, str]]],
+    show_full: bool = False,
+):
+    print(
+        f"Submitting {len(conversations)} conversations as a single batched "
+        "chat() call..."
     )
+    # Batched chat: list[list[message]]; suppress type checker variance issue.
+    outputs = llm.chat(conversations, sampling_params=sampling_params)  # type: ignore[arg-type]
+    for i, out in enumerate(outputs, start=1):
+        print(f"\n=== Conversation {i} ===")
+        if out.outputs:
+            print(out.outputs[0].text)
+        else:  # pragma: no cover - defensive
+            print("(No text output)")
+        if show_full:
+            print("-- Full object --")
+            print(out)
 
-    # Print the response text
-    print("Response:")
-    print(output[0].outputs[0].text)
 
-    # Print full output details for debugging
-    print("\nFull output object:")
-    print(output)
+def main():
+    # Force v1 engine (explicit for this demo)
+    os.environ["VLLM_USE_V1"] = "1"
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    # Helpful for debugging kernel errors (may slow things down)
+    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
+    # Sampling params (tweak as desired)
+    sampling_params = SamplingParams(temperature=0.1, top_p=1.0, max_tokens=128)
+
+    llm = init_llm()
+    conversations = build_conversations()
+    run_batch_chat(llm, sampling_params, conversations, show_full=False)
 
 
 if __name__ == "__main__":
