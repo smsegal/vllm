@@ -1996,32 +1996,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             )
         elif self.speculative_config.method == "draft_model":
             assert isinstance(self.drafter, DraftModelProposer)
-            next_token_id_list: list[int] = []
-            for i, token_ids in enumerate(sampled_token_ids):
-                if token_ids:
-                    # Common case.
-                    next_token_id = token_ids[-1]
-                else:
-                    # Partial prefill (rare case).
-                    # Get the next token id from the request state.
-                    req_id = self.input_batch.req_ids[i]
-                    req_state = self.requests[req_id]
-                    seq_len = (
-                        req_state.num_computed_tokens
-                        + scheduler_output.num_scheduled_tokens[req_id]
-                    )
-                    next_token_id = req_state.get_token_id(seq_len)
-                next_token_id_list.append(next_token_id)
-            next_token_ids = torch.tensor(
-                next_token_id_list, dtype=torch.int32, device=self.device
-            )
             if spec_decode_metadata is None:
                 # input_ids can be None for multimodal models.
                 target_token_ids = self.input_ids[:num_scheduled_tokens]
-                # TODO(woosuk): Support M-RoPE.
                 target_positions = self.positions[:num_scheduled_tokens]
             else:
-                # TODO(woosuk): Refactor this.
                 num_draft_tokens = spec_decode_metadata.num_draft_tokens
                 num_rejected_tokens = [
                     n + 1 - len(sampled_token_ids[i]) if n > 0 else 0
@@ -2035,14 +2014,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 )
 
                 target_token_ids = self.input_ids[token_indices]
-                # TODO(woosuk): Support M-RoPE.
                 target_positions = self.positions[token_indices]
 
             draft_token_ids = self.drafter.propose(
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
                 sampling_metadata=sampling_metadata,
-                next_token_ids=next_token_ids,
                 common_attn_metadata=common_attn_metadata,
             )
             spec_token_ids = draft_token_ids.tolist()

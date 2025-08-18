@@ -98,7 +98,6 @@ class DraftModelProposer:
         self,
         target_token_ids: torch.Tensor,
         target_positions: torch.Tensor,
-        next_token_ids: torch.Tensor,
         common_attn_metadata: CommonAttentionMetadata,
         sampling_metadata: SamplingMetadata,
     ) -> torch.Tensor:
