@@ -129,9 +129,6 @@ class SamplerOutput(
     # specified in lieu of prompt token ids or text.
     sampled_token_embeds: Optional[torch.Tensor] = None
 
-    # Spec decode metrics populated by workers.
-    spec_decode_worker_metrics: Optional[SpecDecodeWorkerMetrics] = None
-
     # per response acceptance lengths
     acceptance_lengths: Optional[list[int]] = None
 

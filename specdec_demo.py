@@ -41,24 +41,24 @@ def build_conversations() -> list[list[dict[str, str]]]:
                 ),
             }
         ],
-        # [
-        #     {
-        #         "role": "user",
-        #         "content": (
-        #             "Write a haiku about speculative decoding accelerating "
-        #             "generation."
-        #         ),
-        #     }
-        # ],
-        # [
-        #     {
-        #         "role": "user",
-        #         "content": (
-        #             "List three potential risks of AI systems and one "
-        #             "mitigation for each."
-        #         ),
-        #     }
-        # ],
+        [
+            {
+                "role": "user",
+                "content": (
+                    "Write a haiku about speculative decoding accelerating "
+                    "generation."
+                ),
+            }
+        ],
+        [
+            {
+                "role": "user",
+                "content": (
+                    "List three potential risks of AI systems and one "
+                    "mitigation for each."
+                ),
+            }
+        ],
     ]
 
 

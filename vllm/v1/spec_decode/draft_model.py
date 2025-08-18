@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from vllm.config import get_layers_from_vllm_config
+from typing import Optional
 import copy
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
@@ -7,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import torch
 
+from vllm.attention.layer import Attention
 from vllm.config import CompilationLevel, VllmConfig
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
@@ -20,6 +23,8 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 logger = init_logger(__name__)
+
+PADDING_SLOT_ID = -1
 
 
 class DraftModelProposer:
@@ -58,6 +63,7 @@ class DraftModelProposer:
                 cache_config.cache_dtype
             ]
 
+        self.block_size = vllm_config.cache_config.block_size
         self.num_speculative_tokens = (
             self.speculative_config.num_speculative_tokens
         )
@@ -93,8 +99,168 @@ class DraftModelProposer:
         self.sampler = Sampler()
         # Placeholder for loaded draft model (set in load_model)
         self.model: Any = None
+        self.attn_layer_names: list[str] = []
+        max_batch_size = vllm_config.scheduler_config.max_num_seqs
+        self.arange = torch.arange(
+            # We need +1 here because the arange is used to set query_start_loc,
+            # which has one more element than batch_size.
+            max_batch_size + 1,
+            device=device,
+            dtype=torch.int32,
+        )
 
     def propose(
+        self,
+        # [num_tokens]
+        target_token_ids: torch.Tensor,
+        # [num_tokens]
+        target_positions: torch.Tensor,
+        # [batch_size]
+        next_token_ids: torch.Tensor,
+        common_attn_metadata: CommonAttentionMetadata,
+        sampling_metadata: SamplingMetadata,
+        mm_embeds: Optional[list[torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        num_tokens = target_token_ids.shape[0]
+        batch_size = next_token_ids.shape[0]
+        last_token_indices = common_attn_metadata.query_start_loc[1:] - 1
+
+        # Shift the input ids by one token.
+        # E.g., [a1, b1, b2, c1, c2, c3] -> [b1, b2, c1, c2, c3, c3]
+        self.input_ids[: num_tokens - 1] = target_token_ids[1:]
+        # Replace the last token with the next token.
+        # E.g., [b1, b2, c1, c2, c3, c3] -> [a2, b2, b3, c2, c3, c4]
+        self.input_ids[last_token_indices] = next_token_ids
+
+        assert self.runner is not None
+
+        # FIXME: need to consider multiple kv_cache_groups
+        attn_metadata = self.runner.attn_groups[0][
+            0
+        ].metadata_builder.build_for_drafting(
+            common_attn_metadata=common_attn_metadata, draft_index=0
+        )
+
+        # At this moment, we assume all eagle layers belong to the same KV
+        # cache group, thus using the same attention metadata.
+        per_layer_attn_metadata = {}
+        for layer_name in self.attn_layer_names:
+            per_layer_attn_metadata[layer_name] = attn_metadata
+        if self.use_cuda_graph and num_tokens <= self.cudagraph_batch_sizes[-1]:
+            num_input_tokens = self.vllm_config.pad_for_cudagraph(num_tokens)
+        else:
+            num_input_tokens = num_tokens
+        # copy inputs to buffer for cudagraph
+        self.positions[:num_tokens] = target_positions
+        # TODO: multimodal support
+        inputs_embeds = None
+        input_ids = self.input_ids[:num_input_tokens]
+
+        with set_forward_context(
+            None,
+            self.vllm_config,
+            num_tokens=num_input_tokens,
+        ):
+            last_hidden_states = self.model(
+                input_ids=input_ids,
+                positions=self.positions[:num_input_tokens],
+                inputs_embeds=inputs_embeds,
+            )
+        sample_hidden_states = last_hidden_states[last_token_indices]
+        logits = self.model.compute_logits(sample_hidden_states, None)
+        positions = target_positions[last_token_indices]
+
+        draft_token_ids = logits.argmax(dim=-1)
+
+        # Early exit if there is only one draft token to be generated.
+        if self.num_speculative_tokens == 1:
+            # [batch_size, 1]
+            return draft_token_ids.view(-1, 1)
+
+        # Generate the remaining draft tokens.
+        draft_token_ids_list = [draft_token_ids]
+
+        if self.use_cuda_graph and batch_size <= self.cudagraph_batch_sizes[-1]:
+            input_batch_size = self.vllm_config.pad_for_cudagraph(batch_size)
+        else:
+            input_batch_size = batch_size
+        attn_metadata.num_actual_tokens = batch_size
+        attn_metadata.max_query_len = 1
+        attn_metadata.query_start_loc = self.arange[: batch_size + 1]
+        for _ in range(self.num_speculative_tokens - 1):
+            # Update the inputs.
+            # cast to int32 is crucial when eagle model is compiled.
+            # tensor.argmax() returns int64 by default.
+            input_ids = draft_token_ids_list[-1].int()
+            positions += 1
+
+            # NOTE(woosuk): We should handle the case where the draft model
+            # generates tokens beyond the max model length. Since it is complex
+            # to remove such requests from the batch, we keep them in the batch
+            # but adjust the position ids and slot mappings to avoid the
+            # out-of-range access during the model execution. The draft tokens
+            # generated with this adjustment should be ignored.
+            exceeds_max_model_len = positions >= self.max_model_len
+            # Mask out the position ids that exceed the max model length.
+            # Otherwise, we may get out-of-range error in RoPE.
+            clamped_positions = torch.where(exceeds_max_model_len, 0, positions)
+
+            # Increment the sequence lengths.
+            attn_metadata.max_seq_len += 1
+            attn_metadata.seq_lens += 1
+            # Consider max model length.
+            attn_metadata.max_seq_len = min(
+                attn_metadata.max_seq_len, self.max_model_len
+            )
+            # For the requests that exceed the max model length, we set the
+            # sequence length to 1 to minimize their overheads in attention.
+            attn_metadata.seq_lens.masked_fill_(exceeds_max_model_len, 1)
+
+            # Compute the slot mapping.
+            block_numbers = clamped_positions // self.block_size
+            block_ids = attn_metadata.block_table.gather(
+                dim=1, index=block_numbers.view(-1, 1)
+            )
+            block_ids = block_ids.view(-1)
+            attn_metadata.slot_mapping = (
+                block_ids * self.block_size
+                + clamped_positions % self.block_size
+            )
+            # Mask out the slot mappings that exceed the max model length.
+            # Otherwise, the KV cache will be inadvertently updated with the
+            # padding tokens.
+            attn_metadata.slot_mapping.masked_fill_(
+                exceeds_max_model_len, PADDING_SLOT_ID
+            )
+
+            # copy inputs to buffer for cudagraph
+            self.input_ids[:batch_size] = input_ids
+            self.positions[:batch_size] = clamped_positions
+            inputs_embeds = None
+            input_ids = self.input_ids[:input_batch_size]
+
+            # Run the model.
+            with set_forward_context(
+                None,
+                self.vllm_config,
+                num_tokens=input_batch_size,
+            ):
+                last_hidden_states = self.model(
+                    input_ids=input_ids,
+                    positions=self.positions[:input_batch_size],
+                    inputs_embeds=inputs_embeds,
+                )
+            logits = self.model.compute_logits(
+                last_hidden_states[:batch_size], None
+            )
+            draft_token_ids = logits.argmax(dim=-1)
+            draft_token_ids_list.append(draft_token_ids)
+
+        # [batch_size, num_speculative_tokens]
+        draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
+        return draft_token_ids
+
+    def propose_old(
         self,
         target_token_ids: torch.Tensor,
         target_positions: torch.Tensor,
@@ -305,6 +471,13 @@ class DraftModelProposer:
             self.model = get_model(
                 vllm_config=vllm_config_seperate_forward_context,
                 model_config=self.draft_model_config,
+            )
+            self.attn_layer_names = list(
+                set(
+                    get_layers_from_vllm_config(
+                        vllm_config_seperate_forward_context, Attention
+                    ).keys()
+                )
             )
             logger.info("LOADED DRAFT MODEL %s", self.draft_model_config.model)
 

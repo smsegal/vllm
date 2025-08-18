@@ -54,7 +54,7 @@ class RejectionSampler(nn.Module):
         bonus_token_ids: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> torch.Tensor:
-        '''
+        """
         Args:
             metadata:
                 Metadata for spec decoding.
@@ -81,7 +81,7 @@ class RejectionSampler(nn.Module):
         Returns:
             output_token_ids (torch.Tensor):
                 A tensor containing the final output token IDs.
-        '''
+        """
         assert metadata.max_spec_len <= MAX_SPEC_LEN
         # [num_tokens, vocab_size]
         # NOTE(woosuk): `target_logits` can be updated in place inside the
@@ -123,13 +123,146 @@ class RejectionSampler(nn.Module):
         """
         output_token_ids_np = output_token_ids.cpu().numpy()
         # Create mask for valid tokens.
-        valid_mask = ((output_token_ids_np != PLACEHOLDER_TOKEN_ID) &
-                      (output_token_ids_np < vocab_size))
+        valid_mask = (output_token_ids_np != PLACEHOLDER_TOKEN_ID) & (
+            output_token_ids_np < vocab_size
+        )
         outputs = [
             row[valid_mask[i]].tolist()
             for i, row in enumerate(output_token_ids_np)
         ]
         return outputs
+
+    @staticmethod
+    def first_rejection_indices(
+        metadata: SpecDecodeMetadata,
+        output_token_ids: torch.Tensor,
+    ) -> list[Optional[int]]:
+        """Return the index of the first rejected token per request.
+
+        A "rejected" position is the first draft position where the output
+        differs from the original draft token id. After the first rejection
+        the Triton kernels fill all remaining draft slots with
+        PLACEHOLDER_TOKEN_ID ( -1 ). If every draft token is accepted the
+        function returns None for that request.
+
+        Args:
+            metadata: SpecDecodeMetadata holding flattened draft tokens.
+            output_token_ids: Tensor shaped [batch_size, max_spec_len+1]
+                returned by the rejection sampler forward().
+
+        Returns:
+            List of length batch_size where each element is either the 0-based
+            index of the first rejected token within that request's block of
+            draft tokens, or None if all draft tokens were accepted.
+        """
+        draft_flat = metadata.draft_token_ids
+        num_draft = metadata.num_draft_tokens
+        cu = metadata.cu_num_draft_tokens.cpu().tolist()
+        batch_size = len(num_draft)
+        assert output_token_ids.shape[0] == batch_size
+        out = output_token_ids.cpu().numpy()
+        draft_np = draft_flat.cpu().numpy()
+        first_rejected: list[Optional[int]] = []
+        prev_cu = 0
+        for i in range(batch_size):
+            end = cu[i]
+            nd = num_draft[i]
+            draft_slice = draft_np[prev_cu:end]
+            row = out[i]
+            rej_idx: Optional[int] = None
+            for j in range(nd):
+                val = row[j]
+                # Placeholder appearing inside draft span implies j is first
+                if val == PLACEHOLDER_TOKEN_ID:
+                    rej_idx = j
+                    break
+                if val != draft_slice[j]:
+                    # This position was recovered (random) or target argmax
+                    # differed (greedy) -> rejection here.
+                    rej_idx = j
+                    break
+            # If all nd positions matched and no placeholder encountered,
+            # all draft tokens accepted -> None.
+            first_rejected.append(rej_idx)
+            prev_cu = end
+        return first_rejected
+
+    @staticmethod
+    def analyze_speculation(
+        metadata: SpecDecodeMetadata,
+        output_token_ids: torch.Tensor,
+    ) -> tuple[
+        list[list[int]],  # accepted_token_ids per request
+        list[Optional[int]],  # rejected_token_id (first rejected) per request
+        list[Optional[int]],  # bonus_token_id (if all accepted) per request
+        list[Optional[int]],  # first_rejection_index per request
+        list[int],  # accepted_count per request
+    ]:
+        """Detailed per-request speculative decoding outcome.
+
+        For each request i (draft length = metadata.num_draft_tokens[i]):
+          - Accepted tokens: leading draft tokens that matched outputs.
+          - First rejected token id: output at first mismatch position j
+            (may be recovered token or differing argmax). None if all accepted.
+          - Bonus token id: token immediately after draft span when all
+            drafts accepted (position draft_len). None otherwise.
+          - first_rejection_index: j or None if fully accepted.
+          - accepted_count: number of accepted draft tokens.
+        """
+        draft_flat = metadata.draft_token_ids.cpu().numpy()
+        num_draft = metadata.num_draft_tokens
+        cu = metadata.cu_num_draft_tokens.cpu().tolist()
+        out = output_token_ids.cpu().numpy()
+        batch_size = len(num_draft)
+        accepted_lists: list[list[int]] = []
+        rejected_ids: list[Optional[int]] = []
+        bonus_ids: list[Optional[int]] = []
+        first_rej_indices: list[Optional[int]] = []
+        accepted_counts: list[int] = []
+        prev_cu = 0
+        for i in range(batch_size):
+            end = cu[i]
+            nd = num_draft[i]
+            draft_slice = draft_flat[prev_cu:end]
+            row = out[i]
+            rej_idx: Optional[int] = None
+            for j in range(nd):
+                val = row[j]
+                if val == PLACEHOLDER_TOKEN_ID:
+                    rej_idx = j
+                    break
+                if val != draft_slice[j]:
+                    rej_idx = j
+                    break
+            if rej_idx is None:
+                # All draft accepted
+                accepted = draft_slice.tolist()
+                accepted_lists.append(accepted)
+                rejected_ids.append(None)
+                first_rej_indices.append(None)
+                accepted_counts.append(nd)
+                # Bonus token (may be PLACEHOLDER if none appended)
+                bonus_token = row[nd] if nd < len(row) else PLACEHOLDER_TOKEN_ID
+                if bonus_token == PLACEHOLDER_TOKEN_ID:
+                    bonus_ids.append(None)
+                else:
+                    bonus_ids.append(int(bonus_token))
+            else:
+                accepted = draft_slice[:rej_idx].tolist()
+                accepted_lists.append(accepted)
+                # Token at rej_idx is the produced (recovered / argmax) token
+                rejected_ids.append(int(row[rej_idx]))
+                bonus_ids.append(None)
+                first_rej_indices.append(rej_idx)
+                accepted_counts.append(rej_idx)
+            prev_cu = end
+        return (
+            accepted_lists,
+            rejected_ids,
+            bonus_ids,
+            first_rej_indices,
+            accepted_counts,
+        )
 
 
 def rejection_sample(
@@ -178,7 +311,7 @@ def rejection_sample(
     if not sampling_metadata.all_random:
         # Rejection sampling for greedy sampling requests.
         target_argmax = target_probs.argmax(dim=-1)
-        rejection_greedy_sample_kernel[(batch_size, )](
+        rejection_greedy_sample_kernel[(batch_size,)](
             output_token_ids,
             cu_num_draft_tokens,
             draft_token_ids,
@@ -214,7 +347,7 @@ def rejection_sample(
     )
 
     # Rejection sampling for random sampling requests.
-    rejection_random_sample_kernel[(batch_size, )](
+    rejection_random_sample_kernel[(batch_size,)](
         output_token_ids,
         cu_num_draft_tokens,
         draft_token_ids,
@@ -322,7 +455,7 @@ def expand_batch_to_tokens(
     batch_size = x.shape[0]
     assert cu_num_tokens.shape[0] == batch_size
     expanded_x = x.new_empty(num_tokens)
-    expand_kernel[(batch_size, )](
+    expand_kernel[(batch_size,)](
         expanded_x,
         x,
         cu_num_tokens,
@@ -366,7 +499,7 @@ def generate_uniform_probs(
             random values in the range [0, 1).
     """
     uniform_probs = torch.rand(
-        (num_tokens, ),
+        (num_tokens,),
         dtype=torch.float32,
         device=device,
     )
@@ -462,8 +595,10 @@ def rejection_greedy_sample_kernel(
         if not rejected:
             draft_token_id = tl.load(draft_token_ids_ptr + start_idx + pos)
             target_argmax_id = tl.load(target_argmax_ptr + start_idx + pos)
-            tl.store(output_token_ids_ptr + req_idx * (max_spec_len + 1) + pos,
-                     target_argmax_id)
+            tl.store(
+                output_token_ids_ptr + req_idx * (max_spec_len + 1) + pos,
+                target_argmax_id,
+            )
             if draft_token_id != target_argmax_id:
                 # Reject.
                 rejected = True
@@ -472,8 +607,11 @@ def rejection_greedy_sample_kernel(
         # If all tokens are accepted, append the bonus token.
         bonus_token_id = tl.load(bonus_token_ids_ptr + req_idx)
         tl.store(
-            output_token_ids_ptr + req_idx * (max_spec_len + 1) +
-            num_draft_tokens, bonus_token_id)
+            output_token_ids_ptr
+            + req_idx * (max_spec_len + 1)
+            + num_draft_tokens,
+            bonus_token_id,
+        )
 
 
 # NOTE(woosuk): Avoid specialization to prevent unnecessary recompilation.
@@ -512,12 +650,16 @@ def rejection_random_sample_kernel(
             if NO_DRAFT_PROBS:
                 draft_prob = 1
             else:
-                draft_prob = tl.load(draft_probs_ptr +
-                                     (start_idx + pos) * vocab_size +
-                                     draft_token_id)
-            target_prob = tl.load(target_probs_ptr +
-                                  (start_idx + pos) * vocab_size +
-                                  draft_token_id)
+                draft_prob = tl.load(
+                    draft_probs_ptr
+                    + (start_idx + pos) * vocab_size
+                    + draft_token_id
+                )
+            target_prob = tl.load(
+                target_probs_ptr
+                + (start_idx + pos) * vocab_size
+                + draft_token_id
+            )
             uniform_prob = tl.load(uniform_probs_ptr + start_idx + pos)
             # NOTE(woosuk): While the draft probability should never be 0,
             # we check it to avoid NaNs. If it happens to be 0, we reject.
@@ -528,15 +670,20 @@ def rejection_random_sample_kernel(
                 # Reject. Use recovered token.
                 rejected = True
                 token_id = tl.load(recovered_token_ids_ptr + start_idx + pos)
-            tl.store(output_token_ids_ptr + req_idx * (max_spec_len + 1) + pos,
-                     token_id)
+            tl.store(
+                output_token_ids_ptr + req_idx * (max_spec_len + 1) + pos,
+                token_id,
+            )
 
     if not rejected:
         # If all tokens are accepted, append the bonus token.
         bonus_token_id = tl.load(bonus_token_ids_ptr + req_idx)
         tl.store(
-            output_token_ids_ptr + req_idx * (max_spec_len + 1) +
-            num_draft_tokens, bonus_token_id)
+            output_token_ids_ptr
+            + req_idx * (max_spec_len + 1)
+            + num_draft_tokens,
+            bonus_token_id,
+        )
 
 
 # NOTE(woosuk): Avoid specialization to prevent unnecessary recompilation.
@@ -560,9 +707,7 @@ def expand_kernel(
     src_val = tl.load(input_ptr + req_idx)
     src_val = tl.where(src_val == replace_from, replace_to, src_val)
     offset = tl.arange(0, MAX_NUM_TOKENS)
-    tl.store(output_ptr + start_idx + offset,
-             src_val,
-             mask=offset < num_tokens)
+    tl.store(output_ptr + start_idx + offset, src_val, mask=offset < num_tokens)
 
 
 @triton.jit
@@ -593,34 +738,41 @@ def sample_recovered_tokens_kernel(
     vocab_offset = tl.arange(0, PADDED_VOCAB_SIZE)
     if NO_DRAFT_PROBS:
         draft_token_id = tl.load(draft_token_ids_ptr + start_idx + pos)
-        orig_prob = tl.load(target_probs_ptr + (start_idx + pos) * vocab_size +
-                            draft_token_id)
+        orig_prob = tl.load(
+            target_probs_ptr + (start_idx + pos) * vocab_size + draft_token_id
+        )
         # Temporarily zero out the probability of the draft token.
         # This is essentially the same as target_prob - draft_prob, except that
         # n-gram does not have draft_prob. We regard it as 1.
         tl.store(
             target_probs_ptr + (start_idx + pos) * vocab_size + draft_token_id,
-            0)
-        prob = tl.load(target_probs_ptr + (start_idx + pos) * vocab_size +
-                       vocab_offset,
-                       mask=vocab_offset < vocab_size,
-                       other=0)
+            0,
+        )
+        prob = tl.load(
+            target_probs_ptr + (start_idx + pos) * vocab_size + vocab_offset,
+            mask=vocab_offset < vocab_size,
+            other=0,
+        )
     else:
-        draft_prob = tl.load(draft_probs_ptr + (start_idx + pos) * vocab_size +
-                             vocab_offset,
-                             mask=vocab_offset < vocab_size,
-                             other=0)
-        target_prob = tl.load(target_probs_ptr +
-                              (start_idx + pos) * vocab_size + vocab_offset,
-                              mask=vocab_offset < vocab_size,
-                              other=0)
+        draft_prob = tl.load(
+            draft_probs_ptr + (start_idx + pos) * vocab_size + vocab_offset,
+            mask=vocab_offset < vocab_size,
+            other=0,
+        )
+        target_prob = tl.load(
+            target_probs_ptr + (start_idx + pos) * vocab_size + vocab_offset,
+            mask=vocab_offset < vocab_size,
+            other=0,
+        )
         prob = tl.maximum(target_prob - draft_prob, 0)
         # NOTE(woosuk): We don't need `prob = prob / tl.sum(prob)` here because
         # `tl.argmax` will select the maximum value.
 
-    q = tl.load(q_ptr + req_idx * vocab_size + vocab_offset,
-                mask=vocab_offset < vocab_size,
-                other=float("-inf"))
+    q = tl.load(
+        q_ptr + req_idx * vocab_size + vocab_offset,
+        mask=vocab_offset < vocab_size,
+        other=float("-inf"),
+    )
     recovered_id = tl.argmax(prob / q, axis=-1)
     tl.store(output_token_ids_ptr + start_idx + pos, recovered_id)
 
@@ -628,4 +780,5 @@ def sample_recovered_tokens_kernel(
         # Restore the original probability.
         tl.store(
             target_probs_ptr + (start_idx + pos) * vocab_size + draft_token_id,
-            orig_prob)
+            orig_prob,
+        )
