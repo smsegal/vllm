@@ -1,16 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from vllm.config import get_layers_from_vllm_config
-from typing import Optional
 import copy
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
 import torch
 
 from vllm.attention.layer import Attention
-from vllm.config import CompilationLevel, VllmConfig
+from vllm.config import (
+    CompilationLevel,
+    VllmConfig,
+    get_layers_from_vllm_config,
+)
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
@@ -70,6 +72,7 @@ class DraftModelProposer:
         self.max_num_tokens = (
             vllm_config.scheduler_config.max_num_batched_tokens
         )
+        self.token_arange_np = np.arange(self.max_num_tokens)
 
         self.use_cuda_graph = (
             self.vllm_config.compilation_config.level
@@ -118,8 +121,6 @@ class DraftModelProposer:
         # [batch_size]
         next_token_ids: torch.Tensor,
         common_attn_metadata: CommonAttentionMetadata,
-        sampling_metadata: SamplingMetadata,
-        mm_embeds: Optional[list[torch.Tensor]] = None,
     ) -> torch.Tensor:
         num_tokens = target_token_ids.shape[0]
         batch_size = next_token_ids.shape[0]
@@ -423,7 +424,7 @@ class DraftModelProposer:
             new_query_start_loc_np[:-1], new_num_tokens_per_req_np
         )
         token_offsets = (
-            np.arange(total_num_tokens, dtype=new_query_start_loc_np.dtype)
+            self.token_arange_np[:total_num_tokens]
             - new_query_start_locs_expanded
         )
 

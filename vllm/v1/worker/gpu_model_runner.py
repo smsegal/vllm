@@ -2034,7 +2034,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 spec_decode_metadata,
                 spec_decode_common_attn_metadata,
             )
-            logger.info(f"DRAFTED {spec_token_ids} ... ")
+            logger.info("DRAFTED %s ... ", self._draft_token_ids)
 
         self.eplb_step()
 
@@ -2099,7 +2099,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 sampling_metadata=sampling_metadata,
             )
         elif self.speculative_config.method == "draft_model":
-            next_token_ids: list[int] = []
+            next_token_id_list: list[int] = []
             for i, token_ids in enumerate(sampled_token_ids):
                 if token_ids:
                     # Common case.
@@ -2114,9 +2114,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         + scheduler_output.num_scheduled_tokens[req_id]
                     )
                     next_token_id = req_state.get_token_id(seq_len)
-                next_token_ids.append(next_token_id)
-            next_token_ids = torch.tensor(
-                next_token_ids, dtype=torch.int32, device=self.device
+                next_token_id_list.append(next_token_id)
+
+            next_token_ids: torch.Tensor = torch.tensor(
+                next_token_id_list, dtype=torch.int32, device=self.device
             )
 
             assert isinstance(self.drafter, DraftModelProposer)
@@ -2145,7 +2146,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             draft_token_ids = self.drafter.propose(
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
-                sampling_metadata=sampling_metadata,
                 next_token_ids=next_token_ids,
                 common_attn_metadata=common_attn_metadata,
             )
@@ -2154,7 +2154,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             assert isinstance(self.drafter, EagleProposer)
             # TODO(woosuk): Refactor the loop.
             req_ids = self.input_batch.req_ids
-            next_token_ids: list[int] = []
+            next_token_id_list: list[int] = []
             for i, token_ids in enumerate(sampled_token_ids):
                 if token_ids:
                     # Common case.
@@ -2169,9 +2169,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         + scheduler_output.num_scheduled_tokens[req_id]
                     )
                     next_token_id = req_state.get_token_id(seq_len)
-                next_token_ids.append(next_token_id)
+                next_token_id_list.append(next_token_id)
             next_token_ids = torch.tensor(
-                next_token_ids, dtype=torch.int32, device=self.device
+                next_token_id_list, dtype=torch.int32, device=self.device
             )
 
             if spec_decode_metadata is None:

@@ -562,7 +562,7 @@ class EagleProposer:
     ) -> tuple[CommonAttentionMetadata, torch.Tensor]:
         """
         This function is used to prepare the inputs for the spec decode.
-        It updates to the common_attn_metadata to account for the rejected
+        It updates the common_attn_metadata to account for the rejected
         tokens (and newly sampled tokens). It also returns the token indices
         of the tokens that should be fed to the speculator.
         """
@@ -618,7 +618,7 @@ class EagleProposer:
         # [0, 1, 2, 3, 4, 5, 6, 7, 8] ->
         # [0, 1, 0, 1, 2, 3, 0, 1, 2]
         #  _r1_  ____r2____  ___r3__
-        token_offests = (
+        token_offsets = (
             self.token_arange_np[:total_num_tokens]
             - new_query_start_locs_expanded
         )
@@ -631,10 +631,10 @@ class EagleProposer:
             query_start_loc_cpu[:-1].numpy(), new_num_tokens_per_req_np
         )
         # Final token indices are:
-        # [0, 1,                                // req 1
-        #  q1 + 0, q1 + 1, q1 + 2, q1 + 3,       // req 2
-        #  q1 + q2 + 0, q1 + q2 + 1, q1 + q2 + 2] // req 3
-        token_indices_np = token_offests + old_query_start_locs_expanded
+        # [0, 1,                                   // req 1
+        #  q1 + 0, q1 + 1, q1 + 2, q1 + 3,         // req 2
+        #  q1 + q2 + 0, q1 + q2 + 1, q1 + q2 + 2]  // req 3
+        token_indices_np = token_offsets + old_query_start_locs_expanded
         token_indices = torch.from_numpy(token_indices_np).to(
             device, non_blocking=True
         )
