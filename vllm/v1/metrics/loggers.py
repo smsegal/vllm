@@ -594,11 +594,6 @@ class PrometheusStatLogger(StatLoggerBase):
                 ],
             )
 
-        #
-        # Cache config info metric
-        #
-        self.log_metrics_info("cache_config", vllm_config.cache_config)
-
     def log_metrics_info(self, type: str, config_obj: SupportsMetricsInfo):
         metrics_info = config_obj.metrics_info()
         metrics_info["engine"] = ""
