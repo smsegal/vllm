@@ -896,7 +896,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Fill unused with 0 for full cuda graph mode.
         self.seq_lens_np[num_reqs:].fill(0)
         self.seq_lens.copy_(self.seq_lens_cpu, non_blocking=True)
-        seq_lens = self.seq_lens[:num_reqs]
         max_seq_len = self.seq_lens_np[:num_reqs].max().item()
 
         # Copy the tensors to the GPU.
@@ -1916,6 +1915,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 logits=logits,
                 sampling_metadata=sampling_metadata,
             )
+            acceptance_lengths = None
         else:
             # When indexing with a tensor (bonus_logits_indices), PyTorch
             # creates a new tensor with separate storage from the original
@@ -1941,6 +1941,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 sampling_metadata,
             )
             sampler_output.sampled_token_ids = output_token_ids
+            # accepted_length = torch.sum(spec_decode_metadata.draft_token_ids == output_token_ids[..., :-1], dim=-1).item()
+            acceptance_info = self.rejection_sampler.analyze_speculation(
+                spec_decode_metadata, output_token_ids
+            )
+            acceptance_lengths = acceptance_info.accepted_count
 
         num_nans_in_logits = {}
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
@@ -1994,6 +1999,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Mask out the sampled tokens that should not be sampled.
         for i in discard_sampled_tokens_req_indices:
             valid_sampled_token_ids[i].clear()
+        # Zero acceptance lengths for requests whose sampled tokens were discarded.
+        if acceptance_lengths is not None:
+            for i in discard_sampled_tokens_req_indices:
+                if i < len(acceptance_lengths):
+                    acceptance_lengths[i] = 0
 
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
@@ -2046,6 +2056,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             prompt_logprobs_dict=prompt_logprobs_dict,
             pooler_output=[],
             kv_connector_output=kv_connector_output,
+            acceptance_lengths=acceptance_lengths,
             num_nans_in_logits=num_nans_in_logits,
         )
 

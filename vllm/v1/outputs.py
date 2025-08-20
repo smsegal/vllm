@@ -8,7 +8,6 @@ import torch
 
 
 class LogprobsLists(NamedTuple):
-
     # [num_reqs, max_num_logprobs + 1]
     logprob_token_ids: list[list[int]]
     # [num_reqs, max_num_logprobs + 1]
@@ -25,7 +24,6 @@ class LogprobsLists(NamedTuple):
 
 
 class LogprobsTensors(NamedTuple):
-
     # [num_reqs, max_num_logprobs + 1]
     logprob_token_ids: torch.Tensor
     # [num_reqs, max_num_logprobs + 1]
@@ -41,18 +39,20 @@ class LogprobsTensors(NamedTuple):
         )
 
     @staticmethod
-    def empty_cpu(num_positions: int,
-                  num_tokens_per_position: int) -> "LogprobsTensors":
+    def empty_cpu(
+        num_positions: int, num_tokens_per_position: int
+    ) -> "LogprobsTensors":
         """Create empty LogprobsTensors on CPU."""
 
         logprob_token_ids = torch.empty(
             (num_positions, num_tokens_per_position),
             dtype=torch.int32,
-            device="cpu")
+            device="cpu",
+        )
         logprobs = torch.empty_like(logprob_token_ids, dtype=torch.float32)
-        selected_token_ranks = torch.empty(num_positions,
-                                           dtype=torch.int32,
-                                           device="cpu")
+        selected_token_ranks = torch.empty(
+            num_positions, dtype=torch.int32, device="cpu"
+        )
         return LogprobsTensors(
             logprob_token_ids=logprob_token_ids,
             logprobs=logprobs,
@@ -62,7 +62,6 @@ class LogprobsTensors(NamedTuple):
 
 @dataclass
 class SamplerOutput:
-
     # [num_reqs, max_num_generated_tokens]
     # Different requests can have different number of generated tokens.
     # All requests are padded to max_num_generated_tokens.
@@ -82,7 +81,6 @@ class KVConnectorOutput:
 # This is expensive for torch.Tensor so prefer to use list instead.
 @dataclass
 class ModelRunnerOutput:
-
     # [num_reqs]
     req_ids: list[str]
     # req_id -> index
@@ -110,23 +108,29 @@ class ModelRunnerOutput:
 
     kv_connector_output: Optional[KVConnectorOutput] = None
 
+    # Per-request acceptance lengths for speculative decoding in this step.
+    # Each element is the number of accepted draft tokens in the current step.
+    # req_id -> num correctly speculated tokens per request
+    acceptance_lengths: Optional[list[int]] = None
+
     # req_id -> num_nans_in_logits
     num_nans_in_logits: Optional[dict[str, int]] = None
 
 
 @dataclass
 class DraftTokenIds:
-
     # [num_reqs]
     req_ids: list[str]
     # num_reqs x num_draft_tokens
     draft_token_ids: list[list[int]]
 
 
-EMPTY_MODEL_RUNNER_OUTPUT = ModelRunnerOutput(req_ids=[],
-                                              req_id_to_index={},
-                                              sampled_token_ids=[],
-                                              logprobs=None,
-                                              prompt_logprobs_dict={},
-                                              pooler_output=[],
-                                              num_nans_in_logits=None)
+EMPTY_MODEL_RUNNER_OUTPUT = ModelRunnerOutput(
+    req_ids=[],
+    req_id_to_index={},
+    sampled_token_ids=[],
+    logprobs=None,
+    prompt_logprobs_dict={},
+    pooler_output=[],
+    num_nans_in_logits=None,
+)
