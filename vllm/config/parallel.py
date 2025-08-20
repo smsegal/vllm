@@ -109,8 +109,9 @@ class ParallelConfig:
     placement_group: Optional[PlacementGroup] = None
     """ray distributed model workers placement group."""
 
-    distributed_executor_backend: Optional[Union[DistributedExecutorBackend,
-                                                 type[ExecutorBase]]] = None
+    distributed_executor_backend: Optional[
+        Union[DistributedExecutorBackend, type[ExecutorBase]]
+    ] = None
     """Backend to use for distributed model
     workers, either "ray" or "mp" (multiprocessing). If the product
     of pipeline_parallel_size and tensor_parallel_size is less than
@@ -136,10 +137,6 @@ class ParallelConfig:
 
     rank: int = 0
     """Global rank in distributed setup."""
-
-    enable_multimodal_encoder_data_parallel: bool = False
-    """ Use data parallelism instead of tensor parallelism for vision encoder.
-    Only support LLama4 for now"""
 
     @property
     def world_size_across_dp(self) -> int:
@@ -171,7 +168,8 @@ class ParallelConfig:
         from torch.distributed import DistNetworkError
 
         from vllm.distributed.utils import (
-            stateless_init_torch_distributed_process_group)
+            stateless_init_torch_distributed_process_group,
+        )
 
         max_retries = 5
         last_exc: Optional[Exception] = None
@@ -183,12 +181,14 @@ class ParallelConfig:
                     self.get_next_dp_init_port(),
                     self.data_parallel_rank,
                     self.data_parallel_size,
-                    backend="gloo")
+                    backend="gloo",
+                )
             except DistNetworkError as e:
                 # We only want to retry when the root cause is EADDRINUSE.
                 if "EADDRINUSE" in str(e):
                     logger.warning(
-                        "Address already in use. Retrying with a new port.")
+                        "Address already in use. Retrying with a new port."
+                    )
                     last_exc = e
                     continue  # try again with a new port
                 raise e
@@ -198,11 +198,8 @@ class ParallelConfig:
         raise last_exc
 
     @staticmethod
-    def has_unfinished_dp(dp_group: ProcessGroup,
-                          has_unfinished: bool) -> bool:
-        tensor = torch.tensor([has_unfinished],
-                              dtype=torch.int32,
-                              device="cpu")
+    def has_unfinished_dp(dp_group: ProcessGroup, has_unfinished: bool) -> bool:
+        tensor = torch.tensor([has_unfinished], dtype=torch.int32, device="cpu")
         # dp rank 0: has_unfinished_seqs=True
         # dp rank 1: has_unfinished_seqs=False
         # aggregated: has_unfinished_seqs=True
@@ -212,13 +209,14 @@ class ParallelConfig:
         return aggregated_has_unfinished
 
     @staticmethod
-    def sync_kv_cache_memory_size(dp_group: ProcessGroup,
-                                  kv_cache_memory: int) -> int:
+    def sync_kv_cache_memory_size(
+        dp_group: ProcessGroup, kv_cache_memory: int
+    ) -> int:
         if kv_cache_memory == -1:
             kv_cache_memory = torch.iinfo(torch.int64).max
-        tensor = torch.tensor([kv_cache_memory],
-                              dtype=torch.int64,
-                              device="cpu")
+        tensor = torch.tensor(
+            [kv_cache_memory], dtype=torch.int64, device="cpu"
+        )
         # we cannot use broadcast for stateless dp group since it depends
         # on global rank
         torch.distributed.all_reduce(tensor, op=ReduceOp.MIN, group=dp_group)
@@ -241,13 +239,15 @@ class ParallelConfig:
         return hashlib.sha256(str(factors).encode()).hexdigest()
 
     def __post_init__(self) -> None:
-        self.world_size = self.pipeline_parallel_size * \
-            self.tensor_parallel_size
+        self.world_size = (
+            self.pipeline_parallel_size * self.tensor_parallel_size
+        )
 
         if self.data_parallel_size_local > self.data_parallel_size:
             raise ValueError(
                 f"data_parallel_size_local ({self.data_parallel_size_local}) "
-                f"must be <= data_parallel_size ({self.data_parallel_size})")
+                f"must be <= data_parallel_size ({self.data_parallel_size})"
+            )
 
         if self.data_parallel_size > 1 or self.data_parallel_size_local == 0:
             # Data parallel was specified in the engine args.
@@ -256,7 +256,8 @@ class ParallelConfig:
             if not (0 <= self.data_parallel_rank < self.data_parallel_size):
                 raise ValueError(
                     f"data_parallel_rank ({self.data_parallel_rank})"
-                    f" must be in the range [0, {self.data_parallel_size})")
+                    f" must be in the range [0, {self.data_parallel_size})"
+                )
         else:
             # Otherwise fall back to env vars (e.g. for offline SPMD case).
             self.data_parallel_size = envs.VLLM_DP_SIZE
@@ -266,11 +267,14 @@ class ParallelConfig:
             self.data_parallel_master_port = envs.VLLM_DP_MASTER_PORT
 
             if self.data_parallel_external_lb:
-                raise ValueError("data_parallel_external_lb can only "
-                                 "be set when data_parallel_size > 1")
+                raise ValueError(
+                    "data_parallel_external_lb can only "
+                    "be set when data_parallel_size > 1"
+                )
 
         if self.distributed_executor_backend == "external_launcher":
             import os
+
             os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
             logger.info("Disabling V1 multiprocessing for external launcher.")
 
@@ -278,14 +282,17 @@ class ParallelConfig:
             if not current_platform.is_cuda():
                 raise ValueError(
                     "Expert parallelism load balancing is only supported on "
-                    "CUDA devices now.")
+                    "CUDA devices now."
+                )
             if self.num_redundant_experts < 0:
                 raise ValueError(
                     "num_redundant_experts must be non-negative, but got "
-                    f"{self.num_redundant_experts}.")
+                    f"{self.num_redundant_experts}."
+                )
             if not self.enable_expert_parallel:
                 raise ValueError(
-                    "enable_expert_parallel must be True to use EPLB.")
+                    "enable_expert_parallel must be True to use EPLB."
+                )
             if self.tensor_parallel_size * self.data_parallel_size <= 1:
                 raise ValueError(
                     "EPLB requires tensor_parallel_size or data_parallel_size "
@@ -296,12 +303,14 @@ class ParallelConfig:
             if self.num_redundant_experts != 0:
                 raise ValueError(
                     "num_redundant_experts should be used with EPLB."
-                    f"{self.num_redundant_experts}.")
+                    f"{self.num_redundant_experts}."
+                )
         if self.distributed_executor_backend is None and self.world_size > 1:
             # We use multiprocessing by default if world_size fits on the
             # current node and we aren't in a ray placement group.
 
             from vllm.executor import ray_utils
+
             backend: DistributedExecutorBackend = "mp"
             ray_found = ray_utils.ray_is_available()
             if current_platform.is_neuron():
@@ -309,31 +318,40 @@ class ParallelConfig:
                 backend = "uni"
             elif current_platform.is_tpu() and envs.VLLM_XLA_USE_SPMD:
                 backend = "uni"
-            elif (current_platform.is_cuda()
-                  and cuda_device_count_stateless() < self.world_size):
+            elif (
+                current_platform.is_cuda()
+                and cuda_device_count_stateless() < self.world_size
+            ):
                 if not ray_found:
-                    raise ValueError("Unable to load Ray: "
-                                     f"{ray_utils.ray_import_err}. Ray is "
-                                     "required for multi-node inference, "
-                                     "please install Ray with `pip install "
-                                     "ray`.")
+                    raise ValueError(
+                        "Unable to load Ray: "
+                        f"{ray_utils.ray_import_err}. Ray is "
+                        "required for multi-node inference, "
+                        "please install Ray with `pip install "
+                        "ray`."
+                    )
                 backend = "ray"
             elif self.data_parallel_backend == "ray":
-                logger.info("Using ray distributed inference because "
-                            "data_parallel_backend is ray")
+                logger.info(
+                    "Using ray distributed inference because "
+                    "data_parallel_backend is ray"
+                )
                 backend = "ray"
             elif ray_found:
                 if self.placement_group:
                     backend = "ray"
                 else:
                     from ray import is_initialized as ray_is_initialized
+
                     if ray_is_initialized():
                         from ray.util import get_current_placement_group
+
                         if get_current_placement_group():
                             backend = "ray"
             self.distributed_executor_backend = backend
-            logger.debug("Defaulting to use %s for distributed inference",
-                         backend)
+            logger.debug(
+                "Defaulting to use %s for distributed inference", backend
+            )
 
         if self.distributed_executor_backend is None and self.world_size == 1:
             self.distributed_executor_backend = "uni"
@@ -342,34 +360,45 @@ class ParallelConfig:
     def use_ray(self) -> bool:
         return self.distributed_executor_backend == "ray" or (
             isinstance(self.distributed_executor_backend, type)
-            and self.distributed_executor_backend.uses_ray)
+            and self.distributed_executor_backend.uses_ray
+        )
 
-    @model_validator(mode='after')
+    @model_validator(mode="after")
     def _verify_args(self) -> Self:
         # Lazy import to avoid circular import
         from vllm.executor.executor_base import ExecutorBase
         from vllm.platforms import current_platform
+
         if self.distributed_executor_backend not in (
-                "ray", "mp", "uni",
-                "external_launcher", None) and not (isinstance(
-                    self.distributed_executor_backend, type) and issubclass(
-                        self.distributed_executor_backend, ExecutorBase)):
+            "ray",
+            "mp",
+            "uni",
+            "external_launcher",
+            None,
+        ) and not (
+            isinstance(self.distributed_executor_backend, type)
+            and issubclass(self.distributed_executor_backend, ExecutorBase)
+        ):
             raise ValueError(
                 "Unrecognized distributed executor backend "
                 f"{self.distributed_executor_backend}. Supported "
                 "values are 'ray', 'mp' 'uni', 'external_launcher' or"
-                " custom ExecutorBase subclass.")
+                " custom ExecutorBase subclass."
+            )
         if self.use_ray:
             from vllm.executor import ray_utils
+
             ray_utils.assert_ray_available()
 
         if not current_platform.use_custom_allreduce():
             self.disable_custom_all_reduce = True
             logger.debug(
                 "Disabled the custom all-reduce kernel because it is not "
-                "supported on current platform.")
+                "supported on current platform."
+            )
         if self.ray_workers_use_nsight and not self.use_ray:
-            raise ValueError("Unable to use nsight profiling unless workers "
-                             "run with Ray.")
+            raise ValueError(
+                "Unable to use nsight profiling unless workers run with Ray."
+            )
 
         return self
