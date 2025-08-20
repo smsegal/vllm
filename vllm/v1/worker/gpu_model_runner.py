@@ -1941,11 +1941,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 sampling_metadata,
             )
             sampler_output.sampled_token_ids = output_token_ids
-            # accepted_length = torch.sum(spec_decode_metadata.draft_token_ids == output_token_ids[..., :-1], dim=-1).item()
-            acceptance_info = self.rejection_sampler.analyze_speculation(
-                spec_decode_metadata, output_token_ids
+            acceptance_lengths = (
+                self.rejection_sampler.calculate_accepted_counts(
+                    spec_decode_metadata, output_token_ids
+                )
             )
-            acceptance_lengths = acceptance_info.accepted_count
 
         num_nans_in_logits = {}
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:

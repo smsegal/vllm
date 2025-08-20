@@ -133,91 +133,34 @@ class RejectionSampler(nn.Module):
         return outputs
 
     @staticmethod
-    def first_rejection_indices(
+    def calculate_accepted_counts(
         metadata: SpecDecodeMetadata,
         output_token_ids: torch.Tensor,
-    ) -> list[Optional[int]]:
-        """Return the index of the first rejected token per request.
+    ) -> list[int]:
+        """Calculate the number of accepted draft tokens for each request.
 
-        A "rejected" position is the first draft position where the output
-        differs from the original draft token id. After the first rejection
-        the Triton kernels fill all remaining draft slots with
-        PLACEHOLDER_TOKEN_ID ( -1 ). If every draft token is accepted the
-        function returns None for that request.
+        This method compares the draft tokens with the output tokens to determine
+        how many draft tokens were accepted before the first rejection occurred.
+        A token is considered rejected if it either:
+        1. Is replaced with a PLACEHOLDER_TOKEN_ID, or
+        2. Differs from the corresponding draft token
 
         Args:
-            metadata: SpecDecodeMetadata holding flattened draft tokens.
-            output_token_ids: Tensor shaped [batch_size, max_spec_len+1]
-                returned by the rejection sampler forward().
+            metadata: SpecDecodeMetadata containing draft token information
+            output_token_ids: Tensor of shape [batch_size, max_spec_len + 1]
+                containing the final output tokens from rejection sampling
 
         Returns:
-            List of length batch_size where each element is either the 0-based
-            index of the first rejected token within that request's block of
-            draft tokens, or None if all draft tokens were accepted.
-        """
-        draft_flat = metadata.draft_token_ids
-        num_draft = metadata.num_draft_tokens
-        cu = metadata.cu_num_draft_tokens.cpu().tolist()
-        batch_size = len(num_draft)
-        assert output_token_ids.shape[0] == batch_size
-        out = output_token_ids.cpu().numpy()
-        draft_np = draft_flat.cpu().numpy()
-        first_rejected: list[Optional[int]] = []
-        prev_cu = 0
-        for i in range(batch_size):
-            end = cu[i]
-            nd = num_draft[i]
-            draft_slice = draft_np[prev_cu:end]
-            row = out[i]
-            rej_idx: Optional[int] = None
-            for j in range(nd):
-                val = row[j]
-                # Placeholder appearing inside draft span implies j is first
-                if val == PLACEHOLDER_TOKEN_ID:
-                    rej_idx = j
-                    break
-                if val != draft_slice[j]:
-                    # This position was recovered (random) or target argmax
-                    # differed (greedy) -> rejection here.
-                    rej_idx = j
-                    break
-            # If all nd positions matched and no placeholder encountered,
-            # all draft tokens accepted -> None.
-            first_rejected.append(rej_idx)
-            prev_cu = end
-        return first_rejected
-
-    @staticmethod
-    def analyze_speculation(
-        metadata: SpecDecodeMetadata,
-        output_token_ids: torch.Tensor,
-    ) -> tuple[
-        list[list[int]],  # accepted_token_ids per request
-        list[Optional[int]],  # rejected_token_id (first rejected) per request
-        list[Optional[int]],  # bonus_token_id (if all accepted) per request
-        list[Optional[int]],  # first_rejection_index per request
-        list[int],  # accepted_count per request
-    ]:
-        """Detailed per-request speculative decoding outcome.
-
-        For each request i (draft length = metadata.num_draft_tokens[i]):
-          - Accepted tokens: leading draft tokens that matched outputs.
-          - First rejected token id: output at first mismatch position j
-            (may be recovered token or differing argmax). None if all accepted.
-          - Bonus token id: token immediately after draft span when all
-            drafts accepted (position draft_len). None otherwise.
-          - first_rejection_index: j or None if fully accepted.
-          - accepted_count: number of accepted draft tokens.
+            List of integers where each element represents the number of
+            accepted draft tokens for the corresponding request. For request i
+            with draft length metadata.num_draft_tokens[i], the accepted count
+            will be in the range [0, metadata.num_draft_tokens[i]].
         """
         draft_flat = metadata.draft_token_ids.cpu().numpy()
         num_draft = metadata.num_draft_tokens
         cu = metadata.cu_num_draft_tokens.cpu().tolist()
         out = output_token_ids.cpu().numpy()
         batch_size = len(num_draft)
-        accepted_lists: list[list[int]] = []
-        rejected_ids: list[Optional[int]] = []
-        bonus_ids: list[Optional[int]] = []
-        first_rej_indices: list[Optional[int]] = []
         accepted_counts: list[int] = []
         prev_cu = 0
         for i in range(batch_size):
@@ -235,34 +178,11 @@ class RejectionSampler(nn.Module):
                     rej_idx = j
                     break
             if rej_idx is None:
-                # All draft accepted
-                accepted = draft_slice.tolist()
-                accepted_lists.append(accepted)
-                rejected_ids.append(None)
-                first_rej_indices.append(None)
                 accepted_counts.append(nd)
-                # Bonus token (may be PLACEHOLDER if none appended)
-                bonus_token = row[nd] if nd < len(row) else PLACEHOLDER_TOKEN_ID
-                if bonus_token == PLACEHOLDER_TOKEN_ID:
-                    bonus_ids.append(None)
-                else:
-                    bonus_ids.append(int(bonus_token))
             else:
-                accepted = draft_slice[:rej_idx].tolist()
-                accepted_lists.append(accepted)
-                # Token at rej_idx is the produced (recovered / argmax) token
-                rejected_ids.append(int(row[rej_idx]))
-                bonus_ids.append(None)
-                first_rej_indices.append(rej_idx)
                 accepted_counts.append(rej_idx)
             prev_cu = end
-        return (
-            accepted_lists,
-            rejected_ids,
-            bonus_ids,
-            first_rej_indices,
-            accepted_counts,
-        )
+        return accepted_counts
 
 
 def rejection_sample(
