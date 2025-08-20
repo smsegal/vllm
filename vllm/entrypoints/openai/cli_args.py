@@ -18,8 +18,14 @@ from pydantic.dataclasses import dataclass
 import vllm.envs as envs
 from vllm.config import config
 from vllm.engine.arg_utils import AsyncEngineArgs, optional_type
-from vllm.entrypoints.chat_utils import (ChatTemplateContentFormatOption,
-                                         validate_chat_template)
+from vllm.entrypoints.chat_utils import (
+    ChatTemplateContentFormatOption,
+    validate_chat_template,
+)
+from vllm.entrypoints.constants import (
+    H11_MAX_HEADER_COUNT_DEFAULT,
+    H11_MAX_INCOMPLETE_EVENT_SIZE_DEFAULT,
+)
 from vllm.entrypoints.openai.serving_models import LoRAModulePath
 from vllm.entrypoints.openai.tool_parsers import ToolParserManager
 from vllm.logger import init_logger
@@ -29,7 +35,6 @@ logger = init_logger(__name__)
 
 
 class LoRAParserAction(argparse.Action):
-
     def __call__(
         self,
         parser: argparse.ArgumentParser,
@@ -56,7 +61,8 @@ class LoRAParserAction(argparse.Action):
                     lora_list.append(lora)
                 except json.JSONDecodeError:
                     parser.error(
-                        f"Invalid JSON format for --lora-modules: {item}")
+                        f"Invalid JSON format for --lora-modules: {item}"
+                    )
                 except TypeError as e:
                     parser.error(
                         f"Invalid fields for --lora-modules: {item} - {str(e)}"
@@ -68,14 +74,16 @@ class LoRAParserAction(argparse.Action):
 @dataclass
 class FrontendArgs:
     """Arguments for the OpenAI-compatible frontend server."""
+
     host: Optional[str] = None
     """Host name."""
     port: int = 8000
     """Port number."""
     uds: Optional[str] = None
     """Unix domain socket path. If set, host and port arguments are ignored."""
-    uvicorn_log_level: Literal["debug", "info", "warning", "error", "critical",
-                               "trace"] = "info"
+    uvicorn_log_level: Literal[
+        "debug", "info", "warning", "error", "critical", "trace"
+    ] = "info"
     """Log level for uvicorn."""
     disable_uvicorn_access_log: bool = False
     """Disable uvicorn access log."""
@@ -172,6 +180,12 @@ schema. Example: `[{"type": "text", "text": "Hello world!"}]`"""
     enable_log_outputs: bool = False
     """If set to True, enable logging of model outputs (generations) 
     in addition to the input logging that is enabled by default."""
+    h11_max_incomplete_event_size: int = H11_MAX_INCOMPLETE_EVENT_SIZE_DEFAULT
+    """Maximum size (bytes) of an incomplete HTTP event (header or body) for
+    h11 parser. Helps mitigate header abuse. Default: 4194304 (4 MB)."""
+    h11_max_header_count: int = H11_MAX_HEADER_COUNT_DEFAULT
+    """Maximum number of HTTP headers allowed in a request for h11 parser.
+    Helps mitigate header abuse. Default: 256."""
 
     @staticmethod
     def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
@@ -205,7 +219,8 @@ schema. Example: `[{"type": "text", "text": "Hello world!"}]`"""
         valid_tool_parsers = list(ToolParserManager.tool_parsers.keys())
         parsers_str = ",".join(valid_tool_parsers)
         frontend_kwargs["tool_call_parser"]["metavar"] = (
-            f"{{{parsers_str}}} or name registered in --tool-parser-plugin")
+            f"{{{parsers_str}}} or name registered in --tool-parser-plugin"
+        )
 
         frontend_group = parser.add_argument_group(
             title="Frontend",
@@ -225,27 +240,32 @@ def make_arg_parser(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
     register all arguments instead of manually enumerating them here. This
     avoids code duplication and keeps the argument definitions in one place.
     """
-    parser.add_argument("model_tag",
-                        type=str,
-                        nargs="?",
-                        help="The model tag to serve "
-                        "(optional if specified in config)")
+    parser.add_argument(
+        "model_tag",
+        type=str,
+        nargs="?",
+        help="The model tag to serve (optional if specified in config)",
+    )
     parser.add_argument(
         "--headless",
         action="store_true",
         default=False,
         help="Run in headless mode. See multi-node data parallel "
-        "documentation for more details.")
-    parser.add_argument("--api-server-count",
-                        "-asc",
-                        type=int,
-                        default=1,
-                        help="How many API server processes to run.")
+        "documentation for more details.",
+    )
+    parser.add_argument(
+        "--api-server-count",
+        "-asc",
+        type=int,
+        default=1,
+        help="How many API server processes to run.",
+    )
     parser.add_argument(
         "--config",
         help="Read CLI options from a config file. "
         "Must be a YAML with the following options: "
-        "https://docs.vllm.ai/en/latest/configuration/serve_args.html")
+        "https://docs.vllm.ai/en/latest/configuration/serve_args.html",
+    )
     parser = FrontendArgs.add_cli_args(parser)
     parser = AsyncEngineArgs.add_cli_args(parser)
 
@@ -262,11 +282,13 @@ def validate_parsed_serve_args(args: argparse.Namespace):
 
     # Enable auto tool needs a tool call parser to be valid
     if args.enable_auto_tool_choice and not args.tool_call_parser:
-        raise TypeError("Error: --enable-auto-tool-choice requires "
-                        "--tool-call-parser")
+        raise TypeError(
+            "Error: --enable-auto-tool-choice requires --tool-call-parser"
+        )
 
 
 def create_parser_for_docs() -> FlexibleArgumentParser:
     parser_for_docs = FlexibleArgumentParser(
-        prog="-m vllm.entrypoints.openai.api_server")
+        prog="-m vllm.entrypoints.openai.api_server"
+    )
     return make_arg_parser(parser_for_docs)
