@@ -19,84 +19,84 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from openai import OpenAI
 
+# ---------------------------------------------------------------------------
+# Prompt templates chosen to be *highly predictable* so speculative decoding
+# can accept long draft spans. Keep them short & deterministic.
+# ---------------------------------------------------------------------------
+TEMPLATES: list[str] = [
+    # Repetitive tokens (single word) -> extremely predictable.
+    (
+        "Repeat the word 'hello' exactly 120 times separated by a single "
+        "space, then on a new line write: COUNT=120."
+    ),
+    # Simple counting sequence.
+    (
+        "List the numbers 1 through 60 separated by commas only (no space). "
+        "Finish with a newline saying LENGTH=60."
+    ),
+    # Alphabet repetition.
+    (
+        "Output the lowercase English alphabet repeated 4 times without "
+        "separators (total length 26*4). Then state: DONE."
+    ),
+    # JSON numeric array.
+    "Produce a JSON array of the integers from 1 to 50 inclusive.",
+    # Line-numbered repetition.
+    (
+        "Create 30 lines. Each line i (starting at 1) must be: i: "
+        "speculative decoding accelerates generation."
+    ),
+    # Even numbers.
+    "List the first 70 even numbers separated by a single space.",
+    # Fixed token block (A's) with grouping.
+    (
+        "Write 200 capital letter A characters. Insert a newline after every "
+        "50 characters."
+    ),
+    # Poem with identical line pattern (predictable line starts).
+    (
+        "Generate a 20-line poem where every line starts with 'Speed gains:' "
+        "followed by the line number."
+    ),
+    # Simple table.
+    (
+        "Create a 10-row markdown table with two columns: n and n_squared "
+        "for n=1..10."
+    ),
+    # Repetition with periodic marker.
+    (
+        "Print the word 'data' 160 times; after every 40 occurrences add the "
+        "token |MARK|."
+    ),
+    # Fibonacci small range (deterministic sequence).
+    "List the first 25 Fibonacci numbers separated by spaces.",
+    # Binary sequence.
+    "Output a line of 128 characters alternating 0 and 1 starting with 0.",
+    # Squares.
+    "Give the squares of 1..40 as 'i^2=val' each on its own line.",
+    # Multiplication table.
+    (
+        "Provide a 12x12 multiplication table; rows each start with row "
+        "number then a colon then 12 products separated by spaces."
+    ),
+    # Simple predictable narrative.
+    (
+        "Write 15 sentences each exactly 'Speculative decoding reduces "
+        "latency.' numbered (1) .. (15)."
+    ),
+    # JSON mapping.
+    (
+        "Return a JSON object mapping letters a through j to their 1-based "
+        "positions."
+    ),
+]
 
-def build_conversations() -> list[list[dict[str, str]]]:
-    """Return multiple conversations (each a list of chat messages)."""
+
+def build_conversations(num: int) -> list[list[dict[str, str]]]:
+    """Return ``num`` single-turn conversations cycling through TEMPLATES."""
     return [
-        [
-            {
-                "role": "user",
-                "content": (
-                    "You are an expert linguist and meticulous reasoning assistant. "
-                    "First, restate the problem. Then count how many times the "
-                    "letter 'B' (case-insensitive) appears in the word "
-                    "'blueberry', explicitly showing each character with its "
-                    "index. After counting, briefly explain whether frequency "
-                    "analysis of single letters can ever be ambiguous in "
-                    "English words and why or why not. Finish with a "
-                    "one-sentence concise answer."
-                ),
-            }
-        ],
-        [
-            {
-                "role": "user",
-                "content": (
-                    "Provide a detailed yet clear comparison between modern "
-                    "server-grade CPUs and data-center GPUs. Cover: (1) "
-                    "architectural execution model (out-of-order, SIMD/SIMT, "
-                    "warps), (2) memory hierarchy and bandwidth vs latency "
-                    "trade-offs, (3) typical workload traits that favor each, "
-                    "(4) power efficiency considerations for large-scale "
-                    "inference, and (5) an illustrative micro-example (e.g., "
-                    "matrix multiply) contrasting scheduling. Conclude with a "
-                    "concise 2-sentence summary."
-                ),
-            }
-        ],
-        [
-            {
-                "role": "user",
-                "content": (
-                    "Carefully compute 12,345 * 678. Show the long multiplication "
-                    "in a neatly formatted stepwise fashion, explain any carries. "
-                    "Then verify using an alternative method (e.g., break 678 "
-                    "into (700 - 22) or use distributive property). State the "
-                    "final "
-                    "product and give a quick sanity check based on order of "
-                    "magnitude."
-                ),
-            }
-        ],
-        [
-            {
-                "role": "user",
-                "content": (
-                    "Compose THREE distinct haiku (traditional 5-7-5 syllable "
-                    "structure) about speculative decoding speeding up large "
-                    "language model text generation. Each haiku should "
-                    "emphasize a different theme: (1) parallel drafting, (2) "
-                    "verification and pruning, (3) user experience / latency. "
-                    "After the haiku, add a one-paragraph prose explanation "
-                    "(<=120 words) of how speculative decoding works "
-                    "conceptually."
-                ),
-            }
-        ],
-        [
-            {
-                "role": "user",
-                "content": (
-                    "Identify five significant risks of deploying large AI "
-                    "systems in production (e.g., hallucination, privacy "
-                    "leakage, prompt injection, model drift, unfair bias). For "
-                    "EACH: (a) 1-sentence risk description, (b) a short "
-                    "real-world scenario, (c) one concrete mitigation with a "
-                    "measurable control, (d) a key metric to monitor. Finish with "
-                    "a compact table summarizing risk -> mitigation -> metric."
-                ),
-            }
-        ],
+        [{"role": "user", "content": prompt}]
+        for prompt in islice(cycle(TEMPLATES), num)
     ]
 
 
@@ -260,15 +260,37 @@ def main():
                     f"Server not ready after {args.wait_timeout} seconds"
                 )
             time.sleep(min(0.25 * attempt, 2.0))
-    conversations = build_conversations()
-    run_batch_chat(
-        client=client,
-        model=args.model,
-        conversations=conversations,
-        temperature=args.temperature,
-        max_tokens=args.max_tokens,
-        top_p=args.top_p,
-    )
+    conversations = build_conversations(args.num_convs)
+
+    if args.list_prompts:
+        for i, conv in enumerate(conversations, 1):
+            print(f"[{i}] {conv[0]['content']}")
+        return
+
+    def do_run():
+        run_batch_chat(
+            client=client,
+            model=args.model,
+            conversations=conversations,
+            temperature=args.temperature,
+            max_tokens=args.max_tokens,
+            top_p=args.top_p,
+            max_inflight=max(1, args.max_inflight),
+        )
+
+    if args.loop:
+        iteration = 0
+        try:
+            while True:
+                iteration += 1
+                print(f"\n##### LOOP ITERATION {iteration} #####")
+                do_run()
+                if args.loop_delay > 0:
+                    time.sleep(args.loop_delay)
+        except KeyboardInterrupt:  # pragma: no cover
+            print("\nLoop interrupted by user; exiting.")
+    else:
+        do_run()
 
 
 if __name__ == "__main__":
