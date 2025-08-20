@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with PagedAttention and Triton prefix prefill."""
+
 from dataclasses import dataclass
 from functools import cache
 from typing import ClassVar, Optional
@@ -9,18 +10,25 @@ import torch
 
 from vllm import _custom_ops as ops
 from vllm import envs
-from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
-                                              AttentionMetadata, AttentionType)
+from vllm.attention.backends.abstract import (
+    AttentionBackend,
+    AttentionImpl,
+    AttentionMetadata,
+    AttentionType,
+)
 from vllm.attention.ops.chunked_prefill_paged_decode import (
-    chunked_prefill_paged_decode)
+    chunked_prefill_paged_decode,
+)
 from vllm.attention.ops.paged_attn import PagedAttention
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
-from vllm.v1.attention.backends.utils import (AttentionCGSupport,
-                                              AttentionMetadataBuilder,
-                                              CommonAttentionMetadata)
+from vllm.v1.attention.backends.utils import (
+    AttentionCGSupport,
+    AttentionMetadataBuilder,
+    CommonAttentionMetadata,
+)
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
@@ -57,20 +65,28 @@ class TritonAttentionMetadata:
 
 
 class TritonAttentionMetadataBuilder(
-        AttentionMetadataBuilder[TritonAttentionMetadata]):
+    AttentionMetadataBuilder[TritonAttentionMetadata]
+):
     cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
 
-    def __init__(self, kv_cache_spec: AttentionSpec, layer_names: list[str],
-                 vllm_config: VllmConfig, device: torch.device):
+    def __init__(
+        self,
+        kv_cache_spec: AttentionSpec,
+        layer_names: list[str],
+        vllm_config: VllmConfig,
+        device: torch.device,
+    ):
         self.device = device
         self.block_size = kv_cache_spec.block_size
         self.kv_cache_spec = kv_cache_spec
 
         model_config = vllm_config.model_config
         self.num_heads_q = model_config.get_num_attention_heads(
-            vllm_config.parallel_config)
+            vllm_config.parallel_config
+        )
         self.num_heads_kv = model_config.get_num_kv_heads(
-            vllm_config.parallel_config)
+            vllm_config.parallel_config
+        )
         self.headdim = model_config.get_head_size()
 
     def build_for_cudagraph_capture(
@@ -83,14 +99,16 @@ class TritonAttentionMetadataBuilder(
         attn_metadata.seq_lens.fill_(1)
         return attn_metadata
 
-    def build(self,
-              common_prefix_len: int,
-              common_attn_metadata: CommonAttentionMetadata,
-              fast_build: bool = False) -> TritonAttentionMetadata:
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+    ) -> TritonAttentionMetadata:
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         max_query_len = common_attn_metadata.max_query_len
 
-        max_seq_len = int(common_attn_metadata.seq_lens_cpu.max())
+        max_seq_len = common_attn_metadata.max_seq_len
         query_start_loc = common_attn_metadata.query_start_loc
         seq_lens = common_attn_metadata.seq_lens
         block_table_tensor = common_attn_metadata.block_table_tensor
@@ -99,14 +117,15 @@ class TritonAttentionMetadataBuilder(
         use_cascade = common_prefix_len > 0
 
         if use_cascade:
-            cu_prefix_query_lens = torch.tensor([0, num_actual_tokens],
-                                                dtype=torch.int32,
-                                                device=self.device)
-            prefix_kv_lens = torch.tensor([common_prefix_len],
-                                          dtype=torch.int32,
-                                          device=self.device)
-            suffix_kv_lens = (common_attn_metadata.seq_lens_cpu -
-                              common_prefix_len)
+            cu_prefix_query_lens = torch.tensor(
+                [0, num_actual_tokens], dtype=torch.int32, device=self.device
+            )
+            prefix_kv_lens = torch.tensor(
+                [common_prefix_len], dtype=torch.int32, device=self.device
+            )
+            suffix_kv_lens = (
+                common_attn_metadata.seq_lens_cpu - common_prefix_len
+            )
             suffix_kv_lens = suffix_kv_lens.to(self.device)
         else:
             cu_prefix_query_lens = None
@@ -133,7 +152,6 @@ class TritonAttentionMetadataBuilder(
 
 
 class TritonAttentionBackend(AttentionBackend):
-
     accept_output_buffer: bool = True
 
     @classmethod
@@ -153,7 +171,8 @@ class TritonAttentionBackend(AttentionBackend):
                 f"Head size {head_size} is not supported by {attn_type}. "
                 f"Supported head sizes are: {supported_head_sizes}. "
                 "Set VLLM_ATTENTION_BACKEND=FLEX_ATTENTION to use "
-                "FlexAttention backend which supports all head sizes.")
+                "FlexAttention backend which supports all head sizes."
+            )
 
     @staticmethod
     def get_name() -> str:
@@ -192,12 +211,10 @@ def use_aiter_unified_attention() -> bool:
     """Check if aiter unified attention should be used."""
     # VLLM_ROCM_USE_AITER_MHA needs to set to 0 as well as it is set
     # to 1 as default
-    return envs.VLLM_ROCM_USE_AITER \
-        and envs.VLLM_USE_AITER_UNIFIED_ATTENTION
+    return envs.VLLM_ROCM_USE_AITER and envs.VLLM_USE_AITER_UNIFIED_ATTENTION
 
 
 class TritonAttentionImpl(AttentionImpl):
-
     def __init__(
         self,
         num_heads: int,
@@ -235,29 +252,36 @@ class TritonAttentionImpl(AttentionImpl):
         TritonAttentionBackend.validate_head_size(head_size)
 
         if attn_type != AttentionType.DECODER:
-            raise NotImplementedError("Encoder self-attention and "
-                                      "encoder/decoder cross-attention "
-                                      "are not implemented for "
-                                      "TritonAttentionImpl")
+            raise NotImplementedError(
+                "Encoder self-attention and "
+                "encoder/decoder cross-attention "
+                "are not implemented for "
+                "TritonAttentionImpl"
+            )
 
         self.fp8_dtype = current_platform.fp8_dtype()
-        self.force_prefill_decode_attn = \
+        self.force_prefill_decode_attn = (
             envs.VLLM_V1_USE_PREFILL_DECODE_ATTENTION
+        )
 
         if not self.force_prefill_decode_attn:
             # If not using prefill decode attention, we use the Triton
             # unified attention implementation.
             if use_aiter_unified_attention():
                 logger.info_once(
-                    "Using aiter unified attention for TritonAttentionImpl")
-                from aiter.ops.triton.unified_attention import (
-                    unified_attention)
+                    "Using aiter unified attention for TritonAttentionImpl"
+                )
+                from aiter.ops.triton.unified_attention import unified_attention
+
                 self.unified_attention = unified_attention
             else:
                 logger.info_once(
-                    "Using vllm unified attention for TritonAttentionImpl")
+                    "Using vllm unified attention for TritonAttentionImpl"
+                )
                 from vllm.attention.ops.triton_unified_attention import (
-                    unified_attention)
+                    unified_attention,
+                )
+
                 self.unified_attention = unified_attention
 
         self.sinks = sinks
@@ -265,7 +289,8 @@ class TritonAttentionImpl(AttentionImpl):
             assert sinks.shape[0] == num_heads, (
                 "Sinks must have the same number of heads as the number of "
                 f"heads in the layer. Sinks shape: {sinks.shape}, "
-                f"num_heads: {num_heads}.")
+                f"num_heads: {num_heads}."
+            )
 
     def forward(
         self,
@@ -294,7 +319,8 @@ class TritonAttentionImpl(AttentionImpl):
         if output_scale is not None:
             raise NotImplementedError(
                 "fused output quantization is not yet supported"
-                " for TritonAttentionImpl")
+                " for TritonAttentionImpl"
+            )
 
         if attn_metadata is None:
             # Profiling run.
@@ -316,7 +342,8 @@ class TritonAttentionImpl(AttentionImpl):
 
         if use_prefill_decode_attn:
             key_cache, value_cache = PagedAttention.split_kv_cache(
-                kv_cache, self.num_kv_heads, self.head_size)
+                kv_cache, self.num_kv_heads, self.head_size
+            )
         else:
             key_cache, value_cache = kv_cache.unbind(0)
 
@@ -350,15 +377,18 @@ class TritonAttentionImpl(AttentionImpl):
             key_cache = key_cache.view(self.fp8_dtype)
             value_cache = value_cache.view(self.fp8_dtype)
             num_tokens, num_heads, head_size = query.shape
-            assert layer._q_scale == 1.0, \
+            assert layer._q_scale == 1.0, (
                 "A non 1.0 q_scale is not currently supported."
+            )
             if not current_platform.is_rocm():
                 # Skip Q quantization on ROCm, since dequantizing back to
                 # f32 in the attention kernel is not supported.
                 query, _ = ops.scaled_fp8_quant(
                     query.reshape(
-                        (num_tokens, num_heads * head_size)).contiguous(),
-                    layer._q_scale)
+                        (num_tokens, num_heads * head_size)
+                    ).contiguous(),
+                    layer._q_scale,
+                )
                 query = query.reshape((num_tokens, num_heads, head_size))
 
         cu_seqlens_q = attn_metadata.query_start_loc
