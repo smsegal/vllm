@@ -32,11 +32,11 @@ def ignore_torch_compile(cls: _T) -> _T:
     a support_torch_compile decorator, but we don't want to
     compile the class `cls` that inherits the parent class.
     This only ignores compiling the forward of the class the
-    decorator is applied to. 
+    decorator is applied to.
 
     If the parent has ignore_torch_compile but the child has
     support_torch_compile, the child will still be compiled.
-    
+
     If the class has one or more submodules
     that have support_torch_compile decorator applied, compile will
     not be ignored for those submodules.
@@ -55,20 +55,26 @@ def _should_ignore_torch_compile(cls) -> bool:
 @overload
 def support_torch_compile(
     *,
-    dynamic_arg_dims: Optional[dict[str, Union[int, list[int]]]],
-) -> Callable[[_T], _T]:
-    ...
+    enable_if: Optional[Callable[[VllmConfig], bool]] = None,
+) -> Callable[[_T], _T]: ...
 
 
 @overload
-def support_torch_compile(cls: _T) -> _T:
-    ...
+def support_torch_compile(
+    *,
+    dynamic_arg_dims: Optional[dict[str, Union[int, list[int]]]],
+) -> Callable[[_T], _T]: ...
+
+
+@overload
+def support_torch_compile(cls: _T) -> _T: ...
 
 
 def support_torch_compile(
     cls: Optional[_T] = None,
     *,
     dynamic_arg_dims: Optional[dict[str, Union[int, list[int]]]] = None,
+    enable_if: Optional[Callable[[VllmConfig], bool]] = None,
 ) -> Union[Callable[[_T], _T], _T]:
     """
     A decorator to add support for compiling the forward method of a class.
@@ -118,12 +124,17 @@ def support_torch_compile(
     NOTE: if an argument is `None`, it should always be passed as `None` during
     the lifetime of the model, otherwise, it cannot be captured as a single
     computation graph.
+
+    `enable_if` is a function that takes a `VllmConfig` object as input and
+    returns a boolean value indicating whether to compile the model or not.
+    This is useful if you want to compile the model only when certain
+    conditions are met.
     """
 
     def cls_decorator_helper(cls: _T) -> _T:
         # helper to pass `dynamic_arg_dims`` to `_support_torch_compile``
         # to avoid too much indentation for `_support_torch_compile``
-        if not hasattr(cls, 'forward'):
+        if not hasattr(cls, "forward"):
             raise TypeError("decorated class should have a forward method.")
         sig = inspect.signature(cls.forward)
         inferred_dynamic_arg_dims = dynamic_arg_dims
@@ -131,25 +142,31 @@ def support_torch_compile(
             inferred_dynamic_arg_dims = {}
             for k, v in sig.parameters.items():
                 if v.annotation in [
-                        torch.Tensor, Optional[torch.Tensor],
-                        IntermediateTensors, Optional[IntermediateTensors]
+                    torch.Tensor,
+                    Optional[torch.Tensor],
+                    IntermediateTensors,
+                    Optional[IntermediateTensors],
                 ]:
                     inferred_dynamic_arg_dims[k] = 0
 
-            logger.debug(("Inferred dynamic dimensions for "
-                          "forward method of %s: %s"), cls,
-                         list(inferred_dynamic_arg_dims.keys()))
+            logger.debug(
+                ("Inferred dynamic dimensions for forward method of %s: %s"),
+                cls,
+                list(inferred_dynamic_arg_dims.keys()),
+            )
 
         if len(inferred_dynamic_arg_dims) == 0:
             raise ValueError(
                 "No dynamic dimensions found in the forward method of "
-                f"{cls}. Please provide dynamic_arg_dims explicitly.")
+                f"{cls}. Please provide dynamic_arg_dims explicitly."
+            )
 
         for k in inferred_dynamic_arg_dims:
             if k not in sig.parameters:
                 raise ValueError(
-                    f"Argument {k} not found in the forward method of {cls}")
-        return _support_torch_compile(cls, inferred_dynamic_arg_dims)
+                    f"Argument {k} not found in the forward method of {cls}"
+                )
+        return _support_torch_compile(cls, inferred_dynamic_arg_dims, enable_if)
 
     if cls is not None:
         # use `support_torch_compile` as a decorator without arguments
@@ -162,6 +179,7 @@ def support_torch_compile(
 def _support_torch_compile(
     cls: _T,
     dynamic_arg_dims: dict[str, Union[int, list[int]]],
+    enable_if: Optional[Callable[[VllmConfig], bool]] = None,
 ) -> _T:
     """
     A decorator to add support for compiling the forward method of a class.
@@ -173,28 +191,32 @@ def _support_torch_compile(
     # take care of method resolution order
     # make sure super().__init__ is called on the base class
     #  other than TorchCompileWrapperWithCustomDispatcher
-    cls.__bases__ = cls.__bases__ + (TorchCompileWrapperWithCustomDispatcher, )
+    cls.__bases__ = cls.__bases__ + (TorchCompileWrapperWithCustomDispatcher,)
 
     old_init = cls.__init__
 
     setattr(cls, IGNORE_COMPILE_KEY, False)
 
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = '', **kwargs):
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "", **kwargs):
         old_init(self, vllm_config=vllm_config, prefix=prefix, **kwargs)
         self.vllm_config = vllm_config
+        enable_compile = enable_if is None or enable_if(vllm_config)
         # for CompilationLevel.DYNAMO_AS_IS , the upper level model runner
         # will handle the compilation, so we don't need to do anything here.
-        self.do_not_compile = \
-            vllm_config.compilation_config.level in [
-            CompilationLevel.NO_COMPILATION, CompilationLevel.DYNAMO_AS_IS
-        ] or not supports_dynamo() or _should_ignore_torch_compile(
-            self.__class__)
+        self.do_not_compile = (
+            vllm_config.compilation_config.level
+            in [CompilationLevel.NO_COMPILATION, CompilationLevel.DYNAMO_AS_IS]
+            or not supports_dynamo()
+            or _should_ignore_torch_compile(self.__class__)
+            or not enable_compile
+        )
         if self.do_not_compile:
             return
 
         compilation_counter.num_models_seen += 1
         TorchCompileWrapperWithCustomDispatcher.__init__(
-            self, compilation_level=vllm_config.compilation_config.level)
+            self, compilation_level=vllm_config.compilation_config.level
+        )
 
     cls.__init__ = __init__
 
@@ -231,11 +253,13 @@ def _support_torch_compile(
                     else:
                         raise ValueError(
                             "Unsupported dynamic dimensions"
-                            f" {dims} for argument {k} with type {type(arg)}.")
+                            f" {dims} for argument {k} with type {type(arg)}."
+                        )
             # here, it is the starting point of the `torch.compile` process
             start_monitoring_torch_compile(self.vllm_config)
-            logger.debug("Start compiling function %s",
-                         self.original_code_object)
+            logger.debug(
+                "Start compiling function %s", self.original_code_object
+            )
 
         # if we don't use custom dispatcher, we can directly call the
         # compiled function and let torch.compile handle the dispatching,
@@ -245,7 +269,8 @@ def _support_torch_compile(
             # while we need to make sure the compiled code is not reused.
             # we need to control all the compilation of the model.
             torch._dynamo.eval_frame.remove_from_cache(
-                self.original_code_object)
+                self.original_code_object
+            )
 
             # collect all relevant files traced by Dynamo,
             # so that the compilation cache can trigger re-compilation
@@ -253,7 +278,8 @@ def _support_torch_compile(
 
             # 1. the file containing the top-level forward function
             self.vllm_config.compilation_config.traced_files.add(
-                self.original_code_object.co_filename)
+                self.original_code_object.co_filename
+            )
 
             # 2. every time Dynamo sees a function call, it will inline
             # the function by calling InliningInstructionTranslator.inline_call
@@ -264,7 +290,8 @@ def _support_torch_compile(
             def patched_inline_call(parent, func, args, kwargs):
                 code = func.get_code()
                 self.vllm_config.compilation_config.traced_files.add(
-                    code.co_filename)
+                    code.co_filename
+                )
                 return inline_call(parent, func, args, kwargs)
 
             # Disable the C++ compilation of symbolic shape guards. C++-fication
@@ -274,17 +301,24 @@ def _support_torch_compile(
             dynamo_config_patches = {}
             try:
                 _ = torch._dynamo.config.enable_cpp_symbolic_shape_guards
-                dynamo_config_patches[
-                    "enable_cpp_symbolic_shape_guards"] = False
+                dynamo_config_patches["enable_cpp_symbolic_shape_guards"] = (
+                    False
+                )
             except AttributeError:
                 # Note: this config is not available in torch 2.6, we can skip
                 # if the config doesn't exist
                 logger.debug(
-                    "enable_cpp_symbolic_shape_guards config not available")
+                    "enable_cpp_symbolic_shape_guards config not available"
+                )
 
-            with patch.object(InliningInstructionTranslator, 'inline_call',
-                              patched_inline_call), torch._dynamo.config.patch(
-                                  **dynamo_config_patches):
+            with (
+                patch.object(
+                    InliningInstructionTranslator,
+                    "inline_call",
+                    patched_inline_call,
+                ),
+                torch._dynamo.config.patch(**dynamo_config_patches),
+            ):
                 output = self.compiled_callable(*args, **kwargs)
             return output
 
