@@ -1235,7 +1235,6 @@ class ModelConfig:
         supported_quantization = me_quant.QUANTIZATION_METHODS
         optimized_quantization_methods = [
             "fp8",
-            "marlin",
             "modelopt",
             "gptq_marlin_24",
             "gptq_marlin",
@@ -1272,7 +1271,6 @@ class ModelConfig:
             # `override_quantization_method` method) must be checked in order
             # of preference (this is particularly important for GPTQ).
             overrides = [
-                "marlin",
                 "bitblas",
                 "gptq_marlin_24",
                 "gptq_marlin",
