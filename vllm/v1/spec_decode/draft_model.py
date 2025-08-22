@@ -471,11 +471,10 @@ class DraftModelProposer:
 
     @torch.inference_mode()
     def dummy_run(self, num_tokens: int):
+        assert self.draft_vllm_config is not None
         with set_forward_context(
             None,
-            self.draft_vllm_config
-            if getattr(self, "draft_vllm_config", None) is not None
-            else self.vllm_config,
+            self.draft_vllm_config,
             num_tokens=num_tokens,
         ):
             input_ids = self.input_ids[:num_tokens]
