@@ -136,7 +136,17 @@ def run_batch_chat(
         if not hasattr(comp, "choices"):
             raise RuntimeError("Streaming object returned unexpectedly")
         text = str(comp.choices[0].message.content)  # type: ignore[union-attr]
-        return idx, text, time.time() - started
+        # Extract speculative decoding acceptance lengths if provided by server.
+        acceptance_lengths: list[int] = []
+        try:
+            model_extra = getattr(comp, "model_extra", None)
+            if isinstance(model_extra, dict):
+                val = model_extra.get("acceptance_lengths")
+                if isinstance(val, list):
+                    acceptance_lengths = [int(x) for x in val]
+        except Exception:
+            acceptance_lengths = []
+        return idx, text, time.time() - started, acceptance_lengths
 
     # Process in batches of size max_inflight while preserving order.
     for start in range(0, len(conversations), max_inflight):
@@ -148,20 +158,24 @@ def run_batch_chat(
                 ex.submit(_issue, (start + i + 1, conv)): (start + i + 1)
                 for i, conv in enumerate(batch)
             }
-            results: dict[int, tuple[str, float]] = {}
+            results: dict[int, tuple[str, float, list[int]]] = {}
             for fut in as_completed(futures):
                 idx = futures[fut]
                 try:
-                    got_idx, text, elapsed = fut.result()
-                    results[got_idx] = (text, elapsed)
+                    got_idx, text, elapsed, acc = fut.result()
+                    results[got_idx] = (text, elapsed, acc)
                 except Exception as e:  # pragma: no cover
-                    results[idx] = (f"<ERROR: {e}>", 0.0)
+                    results[idx] = (f"<ERROR: {e}>", 0.0, [])
         # Emit in order for the batch.
         for idx in range(start + 1, start + 1 + len(batch)):
-            text, elapsed = results[idx]
+            text, elapsed, acc = results[idx]
             print(f"\n=== Conversation {idx} ===")
-            print(text)
+            # print(text)
             print(f"-- elapsed: {elapsed:.3f}s")
+            if acc:
+                print(f"-- acceptance_lengths: {acc} (total={sum(acc)})")
+            else:
+                print("-- acceptance_lengths: []")
 
     print(f"\nCompleted in {time.time() - start_total:.3f}s total.")
 
@@ -238,9 +252,6 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
-    # Set defaults (client side; server must be started separately with same)
-    os.environ.setdefault("VLLM_USE_V1", "1")
-    os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
     client = OpenAI(api_key=args.api_key, base_url=args.api_base)
 

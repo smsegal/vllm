@@ -1999,11 +1999,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Mask out the sampled tokens that should not be sampled.
         for i in discard_sampled_tokens_req_indices:
             valid_sampled_token_ids[i].clear()
-        # Zero acceptance lengths for requests whose sampled tokens were discarded.
-        if acceptance_lengths is not None:
-            for i in discard_sampled_tokens_req_indices:
-                if i < len(acceptance_lengths):
-                    acceptance_lengths[i] = 0
+
 
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
@@ -2109,15 +2105,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 sampling_metadata=sampling_metadata,
             )
         elif self.speculative_config.method == "draft_model":
+            # Build per-request next-token ids (baseline for draft decode).
             next_token_id_list: list[int] = []
+            req_ids_for_batch = self.input_batch.req_ids
             for i, token_ids in enumerate(sampled_token_ids):
                 if token_ids:
-                    # Common case.
                     next_token_id = token_ids[-1]
                 else:
                     # Partial prefill (rare case).
-                    # Get the next token id from the request state.
-                    req_id = self.input_batch.req_ids[i]
+                    req_id = req_ids_for_batch[i]
                     req_state = self.requests[req_id]
                     seq_len = (
                         req_state.num_computed_tokens
@@ -2125,41 +2121,163 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     )
                     next_token_id = req_state.get_token_id(seq_len)
                 next_token_id_list.append(next_token_id)
-
             next_token_ids: torch.Tensor = torch.tensor(
                 next_token_id_list, dtype=torch.int32, device=self.device
             )
 
+            # reconstruct a coherent per-request window matching the target's
+            # effective context (use full available context). We gather the last
+            # Li tokens per request from the CPU token buffer and map them to KV
+            # slots using the same block table + positions logic as target.
             assert isinstance(self.drafter, DraftModelProposer)
-            if spec_decode_metadata is None:
-                # input_ids can be None for multimodal models.
-                target_token_ids = self.input_ids[:num_scheduled_tokens]
-                target_positions = self.positions[:num_scheduled_tokens]
-            else:
-                num_draft_tokens = spec_decode_metadata.num_draft_tokens
-                num_rejected_tokens = [
-                    n + 1 - len(sampled_token_ids[i]) if n > 0 else 0
-                    for i, n in enumerate(num_draft_tokens)
-                ]
-                num_rejected_tokens_cpu = torch.tensor(
-                    num_rejected_tokens, dtype=torch.int32
-                )
-                common_attn_metadata, token_indices = (
-                    self.drafter.prepare_inputs(
-                        common_attn_metadata, num_rejected_tokens_cpu
-                    )
-                )
 
-                target_token_ids = self.input_ids[token_indices]
-                target_positions = self.positions[token_indices]
+            # Compute per-request lengths and cumulative sums on CPU.
+            num_reqs = self.input_batch.num_reqs
 
-            draft_token_ids = self.drafter.propose(
-                target_token_ids=target_token_ids,
-                target_positions=target_positions,
-                next_token_ids=next_token_ids,
-                common_attn_metadata=common_attn_metadata,
+            # For each request i, seq_len_i = num_computed_tokens + num_scheduled_tokens
+            # We will use the entire available context for window Li = seq_len_i.
+            seq_len_cpu = (
+                self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs]
+                + torch.tensor([scheduler_output.num_scheduled_tokens[req_id] for req_id in req_ids_for_batch],
+                               dtype=torch.int32, device=self.input_batch.num_computed_tokens_cpu_tensor.device)
             )
-            spec_token_ids = draft_token_ids.tolist()
+            seq_len_np = seq_len_cpu.cpu().numpy().astype(np.int32, copy=False)
+
+            # Build query_start_loc for the draft window: cumulative sum of Li.
+            draft_query_start_loc_cpu = torch.zeros(
+                (num_reqs + 1,), dtype=torch.int32, pin_memory=True
+            )
+            draft_qsl_np = draft_query_start_loc_cpu.numpy()
+            draft_qsl_np[1:] = seq_len_np.cumsum()
+            total_draft_tokens = int(draft_qsl_np[-1])
+
+            # DEBUG: Print draft window stats
+            print(f"[DEBUG] Draft window: total_draft_tokens={total_draft_tokens}, "
+                  f"max_num_tokens={self.max_num_tokens}, "
+                  f"num_reqs={num_reqs}, seq_lens={seq_len_np}")
+
+            # Allocate CPU staging buffers for gather (pinned for faster H2D).
+            gather_indices = torch.empty((total_draft_tokens,),
+                                         dtype=torch.int64,
+                                         device="cpu",
+                                         pin_memory=True)
+            positions_cpu = torch.empty((total_draft_tokens,),
+                                        dtype=torch.int64,
+                                        device="cpu",
+                                        pin_memory=True)
+
+            # Fill per-request slices (flattened indices into [num_reqs, max_model_len]).
+            max_model_len = self.input_batch.token_ids_cpu_tensor.shape[1]
+            offset = 0
+            for i in range(num_reqs):
+                Li = int(seq_len_np[i])
+                if Li == 0:
+                    continue
+                start = offset
+                end = offset + Li
+                # Absolute positions for request i within its sequence: [0 .. Li-1]
+                pos_i = np.arange(Li, dtype=np.int64)
+                positions_cpu[start:end].numpy()[:] = pos_i
+                row_base = i * max_model_len
+                gather_indices[start:end].numpy()[:] = row_base + pos_i
+                offset = end
+
+            # Gather token ids into a CPU buffer. Use the persistent buffer only
+            # if capacity is sufficient; otherwise allocate a temporary buffer.
+            use_persistent_cpu_buf = total_draft_tokens <= self.max_num_tokens
+            # print(f"[DEBUG] Draft gather: use_persistent_cpu_buf={use_persistent_cpu_buf}, "
+            #       f"total_draft_tokens={total_draft_tokens}")
+
+            if use_persistent_cpu_buf:
+                draft_input_ids_cpu = self.input_ids_cpu[:total_draft_tokens]
+                # print(f"[DEBUG] Using persistent CPU buffer, size={total_draft_tokens}")
+            else:
+                # print(f"[DEBUG] Allocating temporary CPU buffer, size={total_draft_tokens * 4} bytes")
+                try:
+                    draft_input_ids_cpu = torch.empty(
+                        (total_draft_tokens,),
+                        dtype=torch.int32,
+                        device="cpu",
+                        pin_memory=True,
+                    )
+                    # print(f"[DEBUG] Successfully allocated temporary CPU buffer")
+                except Exception as e:
+                    print(f"[DEBUG] ERROR allocating temporary CPU buffer: {e}")
+                    raise
+            torch.index_select(
+                self.input_batch.token_ids_cpu_tensor.flatten(),
+                0,
+                gather_indices.to(self.input_batch.token_ids_cpu_tensor.device, non_blocking=True),
+                out=draft_input_ids_cpu,
+            )
+
+            # Build draft CommonAttentionMetadata using
+            # DraftModelProposer.prepare_inputs to reuse
+            # BlockTable.compute_slot_mapping.
+            # print(f"[DEBUG] Calling drafter.prepare_inputs with "
+            #       f"window_seq_lens_cpu.shape={seq_len_cpu.cpu().shape}, "
+            #       f"token_indices_cpu.shape={gather_indices.shape}")
+            draft_common_attn_metadata = self.drafter.prepare_inputs(
+                window_seq_lens_cpu=seq_len_cpu.cpu(),
+                token_indices_cpu=gather_indices,
+                block_table=self.input_batch.block_table[0],
+            )
+            # print(f"[DEBUG] Draft metadata created: num_actual_tokens={draft_common_attn_metadata.num_actual_tokens}")
+
+            # Copy gathered input ids and positions to GPU tensors and propose.
+            # print(f"[DEBUG] Allocating GPU tensors: input_ids={total_draft_tokens * 4} bytes, "
+            #       f"positions={total_draft_tokens * 8} bytes")
+            try:
+                # Check GPU memory before allocation
+                if hasattr(torch.cuda, 'memory_allocated'):
+                    gpu_mem_before = torch.cuda.memory_allocated(self.device)
+                    # print(f"[DEBUG] GPU memory before allocation: {gpu_mem_before / 1024**2:.1f} MB")
+
+                draft_input_ids_gpu = torch.empty(
+                    (total_draft_tokens,), dtype=torch.int32, device=self.device
+                )
+                draft_positions_gpu = torch.empty(
+                    (total_draft_tokens,), dtype=torch.int64, device=self.device
+                )
+
+                if hasattr(torch.cuda, 'memory_allocated'):
+                    gpu_mem_after = torch.cuda.memory_allocated(self.device)
+                    # print(f"[DEBUG] GPU memory after allocation: {gpu_mem_after / 1024**2:.1f} MB, "
+                    #       f"delta: {(gpu_mem_after - gpu_mem_before) / 1024**2:.1f} MB")
+
+                # print(f"[DEBUG] Successfully allocated GPU tensors")
+                draft_input_ids_gpu.copy_(draft_input_ids_cpu, non_blocking=True)
+                draft_positions_gpu.copy_(positions_cpu.to(self.device, non_blocking=True), non_blocking=True)
+                # print(f"[DEBUG] Successfully copied data to GPU tensors")
+            except Exception as e:
+                print(f"[DEBUG] ERROR with GPU tensor allocation/copy: {e}")
+                raise
+
+            # print(f"[DEBUG] Calling drafter.propose with tensors: "
+            #       f"input_ids.shape={draft_input_ids_gpu.shape}, "
+            #       f"positions.shape={draft_positions_gpu.shape}, "
+            #       f"next_token_ids.shape={next_token_ids.shape}")
+            try:
+                draft_token_ids = self.drafter.propose(
+                    target_token_ids=draft_input_ids_gpu,
+                    target_positions=draft_positions_gpu,
+                    next_token_ids=next_token_ids,
+                    common_attn_metadata=draft_common_attn_metadata,
+                )
+                # print(f"[DEBUG] drafter.propose returned shape: {draft_token_ids.shape}")
+                spec_token_ids = draft_token_ids.tolist()
+                # print(f"[DEBUG] Converted to list, length: {len(spec_token_ids)}")
+            except Exception as e:
+                print(f"[DEBUG] ERROR in drafter.propose: {e}")
+                raise
+
+            # Clean up temporary tensors if we allocated them
+            if not use_persistent_cpu_buf:
+                # print(f"[DEBUG] Cleaning up temporary CPU tensor")
+                del draft_input_ids_cpu
+            # print(f"[DEBUG] Cleaning up GPU tensors")
+            del draft_input_ids_gpu
+            del draft_positions_gpu
         elif self.speculative_config.use_eagle():
             assert isinstance(self.drafter, EagleProposer)
             # TODO(woosuk): Refactor the loop.

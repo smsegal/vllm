@@ -953,8 +953,8 @@ class Scheduler(SchedulerInterface):
                         kv_transfer_params=kv_transfer_params,
                         acceptance_length=(
                             model_runner_output.acceptance_lengths[req_index]
-                            if model_runner_output.acceptance_lengths
-                            is not None
+                            if (scheduled_spec_token_ids and
+                                model_runner_output.acceptance_lengths is not None)
                             else None
                         ),
                         num_cached_tokens=request.num_cached_tokens,

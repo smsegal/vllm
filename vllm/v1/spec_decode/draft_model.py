@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
-from dataclasses import replace
-from typing import TYPE_CHECKING, Any, Optional
+
+from typing import TYPE_CHECKING, Any, Optional, cast
 
 import numpy as np
 import torch
 
+from vllm.attention.backends.utils import AttentionMetadataBuilder
 from vllm.attention.layer import Attention
 from vllm.config import (
     CompilationLevel,
@@ -18,6 +19,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
 from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE, is_pin_memory_available
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
+from vllm.v1.worker.block_table import BlockTable
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.worker.utils import bind_kv_cache
@@ -133,12 +135,23 @@ class DraftModelProposer:
         batch_size = next_token_ids.shape[0]
         last_token_indices = common_attn_metadata.query_start_loc[1:] - 1
 
-        # Shift the input ids by one token.
-        # E.g., [a1, b1, b2, c1, c2, c3] -> [b1, b2, c1, c2, c3, c3]
-        self.input_ids[: num_tokens - 1] = target_token_ids[1:]
-        # Replace the last token with the next token.
-        # E.g., [b1, b2, c1, c2, c3, c3] -> [a2, b2, b3, c2, c3, c4]
-        self.input_ids[last_token_indices] = next_token_ids
+        # print(
+        #     f"[DEBUG] DraftModelProposer.propose: num_tokens={num_tokens}, "
+        #     f"batch_size={batch_size}, max_num_tokens={self.max_num_tokens}"
+        # )
+
+        # Prefill the true window (no shift) to rebuild KV coherently.
+        use_tmp_for_prefill = num_tokens > self.max_num_tokens
+        # print(
+        #     f"[DEBUG] DraftModelProposer.propose: use_tmp_for_prefill={use_tmp_for_prefill}"
+        # )
+        if use_tmp_for_prefill:
+            # Directly use the provided window tokens on device.
+            prefill_input_ids = target_token_ids
+        else:
+            # Copy to the persistent buffer so we can pad for CUDA graph if needed.
+            self.input_ids[:num_tokens] = target_token_ids
+            prefill_input_ids = self.input_ids
 
         assert self.runner is not None
         # Use draft-specific config if available
@@ -148,7 +161,7 @@ class DraftModelProposer:
             getattr(self, "draft_max_model_len", None) or self.max_model_len
         )
 
-        # Build attention metadata with the correct (draft) builder.
+        # Build attention metadata using the draft-specific builder.
         assert self.draft_attn_metadata_builder is not None, (
             "DraftModelProposer.load_model() must be called before propose; "
             "draft_attn_metadata_builder is not initialized."
@@ -160,77 +173,94 @@ class DraftModelProposer:
         per_layer_attn_metadata = {}
         for layer_name in self.attn_layer_names:
             per_layer_attn_metadata[layer_name] = attn_metadata
-        if self.use_cuda_graph and num_tokens <= self.cudagraph_batch_sizes[-1]:
+
+        if (
+            self.use_cuda_graph
+            and (not use_tmp_for_prefill)
+            and num_tokens <= self.cudagraph_batch_sizes[-1]
+        ):
             num_input_tokens = vllm_config_local.pad_for_cudagraph(num_tokens)
+            # copy inputs to buffer for cudagraph
+            self.positions[:num_tokens] = target_positions
+            positions_in = self.positions[:num_input_tokens]
+            input_ids = prefill_input_ids[:num_input_tokens]
+            # Pad slot_mapping tail with -1 (PADDING_SLOT_ID) for CUDA graph safety.
+            if num_input_tokens > num_tokens:
+                sm = attn_metadata.slot_mapping
+                pad_len = num_input_tokens - num_tokens
+                pad = torch.full(
+                    (pad_len,),
+                    PADDING_SLOT_ID,
+                    dtype=sm.dtype,
+                    device=sm.device,
+                )
+                attn_metadata.slot_mapping = torch.cat(
+                    [sm[:num_tokens], pad], dim=0
+                )
+            # print(
+            #     f"[DEBUG] DraftModelProposer.propose: using CUDA graph, num_input_tokens={num_input_tokens}"
+            # )
         else:
             num_input_tokens = num_tokens
-        # copy inputs to buffer for cudagraph
-        self.positions[:num_tokens] = target_positions
+            positions_in = target_positions
+            input_ids = prefill_input_ids[:num_input_tokens]
+            # print(
+            #     f"[DEBUG] DraftModelProposer.propose: not using CUDA graph, num_input_tokens={num_input_tokens}"
+            # )
         # TODO: multimodal support
         inputs_embeds = None
-        input_ids = self.input_ids[:num_input_tokens]
 
+        # True-window prefill (writes KV at correct slots for the window).
         with set_forward_context(
             per_layer_attn_metadata,
             vllm_config_local,
             num_tokens=num_input_tokens,
         ):
-            last_hidden_states = self.model(
+            _ = self.model(
                 input_ids=input_ids,
-                positions=self.positions[:num_input_tokens],
+                positions=positions_in,
                 inputs_embeds=inputs_embeds,
             )
-        sample_hidden_states = last_hidden_states[last_token_indices]
-        logits = self.model.compute_logits(sample_hidden_states, None)
+
+        # Start decode from the last position of each request.
         positions = target_positions[last_token_indices]
 
-        draft_token_ids = logits.argmax(dim=-1)
+        # Generate draft tokens via explicit decode loop.
+        draft_token_ids_list: list[torch.Tensor] = []
 
-        # Early exit if there is only one draft token to be generated.
-        if self.num_speculative_tokens == 1:
-            # [batch_size, 1]
-            return draft_token_ids.view(-1, 1)
-
-        # Generate the remaining draft tokens.
-        draft_token_ids_list = [draft_token_ids]
-
-        if self.use_cuda_graph and batch_size <= self.cudagraph_batch_sizes[-1]:
+        if (
+            self.use_cuda_graph
+            and batch_size <= self.cudagraph_batch_sizes[-1]
+        ):
             input_batch_size = vllm_config_local.pad_for_cudagraph(batch_size)
         else:
             input_batch_size = batch_size
         attn_metadata.num_actual_tokens = batch_size
         attn_metadata.max_query_len = 1
         attn_metadata.query_start_loc = self.arange[: batch_size + 1]
-        for _ in range(self.num_speculative_tokens - 1):
+        for i in range(self.num_speculative_tokens):
             # Update the inputs.
-            # cast to int32 is crucial when eagle model is compiled.
-            # tensor.argmax() returns int64 by default.
-            input_ids = draft_token_ids_list[-1].int()
+            # tensor.argmax() returns int64 by default; cast to int32 is crucial when compiled.
+            if i == 0:
+                input_ids = next_token_ids.int()
+            else:
+                input_ids = draft_token_ids_list[-1].int()
             positions += 1
 
-            # NOTE(woosuk): We should handle the case where the draft model
-            # generates tokens beyond the max model length. Since it is complex
-            # to remove such requests from the batch, we keep them in the batch
-            # but adjust the position ids and slot mappings to avoid the
-            # out-of-range access during the model execution. The draft tokens
-            # generated with this adjustment should be ignored.
+            # Handle positions exceeding max model length (ignore by masking).
             exceeds_max_model_len = positions >= max_model_len
-            # Mask out the position ids that exceed the max model length.
-            # Otherwise, we may get out-of-range error in RoPE.
             clamped_positions = torch.where(exceeds_max_model_len, 0, positions)
 
             # Increment the sequence lengths.
             attn_metadata.max_seq_len += 1
             attn_metadata.seq_lens += 1
-            # Consider max model length.
             attn_metadata.max_seq_len = min(
                 attn_metadata.max_seq_len, max_model_len
             )
-            # For the requests that exceed the max model length, we set the
-            # sequence length to 1 to minimize their overheads in attention.
+            # For the requests that exceed the max model length, set seq len to 1 to reduce overhead.
             attn_metadata.seq_lens.masked_fill_(exceeds_max_model_len, 1)
 
-            # Compute the slot mapping.
+            # Compute the slot mapping for this decode step.
             block_numbers = clamped_positions // block_size
             block_ids = attn_metadata.block_table.gather(
                 dim=1, index=block_numbers.view(-1, 1)
@@ -240,11 +270,23 @@ class DraftModelProposer:
                 block_ids * block_size + clamped_positions % block_size
             )
             # Mask out the slot mappings that exceed the max model length.
-            # Otherwise, the KV cache will be inadvertently updated with the
-            # padding tokens.
             attn_metadata.slot_mapping.masked_fill_(
                 exceeds_max_model_len, PADDING_SLOT_ID
             )
+
+            # Pad slot_mapping tail with -1 for CUDA graph capture safety.
+            if input_batch_size > batch_size:
+                sm = attn_metadata.slot_mapping
+                pad_len = input_batch_size - batch_size
+                pad = torch.full(
+                    (pad_len,),
+                    PADDING_SLOT_ID,
+                    dtype=sm.dtype,
+                    device=sm.device,
+                )
+                attn_metadata.slot_mapping = torch.cat(
+                    [sm[:batch_size], pad], dim=0
+                )
 
             # copy inputs to buffer for cudagraph
             self.input_ids[:batch_size] = input_ids
@@ -252,7 +294,7 @@ class DraftModelProposer:
             inputs_embeds = None
             input_ids = self.input_ids[:input_batch_size]
 
-            # Run the model.
+            # Run the model for this decode step.
             with set_forward_context(
                 per_layer_attn_metadata,
                 vllm_config_local,
@@ -271,85 +313,114 @@ class DraftModelProposer:
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
+        # print(
+        #     f"[DEBUG] DraftModelProposer.propose: returning draft_token_ids.shape={draft_token_ids.shape}"
+        # )
         return draft_token_ids
 
     def prepare_inputs(
         self,
-        common_attn_metadata: CommonAttentionMetadata,
-        # [batch_size]
-        num_rejected_tokens: torch.Tensor,
-    ) -> tuple[CommonAttentionMetadata, torch.Tensor]:
+        # Number of tokens per request (window length), [batch_size] on CPU
+        window_seq_lens_cpu: torch.Tensor,
+        # Flattened indices into the runner's CPU token buffer representing the
+        # concatenated window tokens for all requests (length = sum(Li)), on CPU
+        token_indices_cpu: torch.Tensor,
+        # Block table to compute slot mapping (KV group 0)
+        block_table: BlockTable,
+    ) -> CommonAttentionMetadata:
         """
-        Prepare inputs for the draft model by reconstructing the full sequences
-        after accounting for rejected tokens (similar to EAGLE's prepare_inputs).
+        Prepare attention metadata for a coherent per-request context window by
+        computing a dynamic slot_mapping directly from the block table. This avoids
+        using BlockTable.compute_slot_mapping(), which writes into a fixed-size buffer
+        limited by max_num_batched_tokens and can overflow when the window spans more
+        tokens than that cap.
+
+        This method ensures the draft KV matches the target's current block table
+        mapping for the effective target context (e.g., full context or a configured
+        sliding window).
+
+        Args:
+          window_seq_lens_cpu: [num_reqs] tensor of Li values (per-request window
+            lengths) on CPU.
+          token_indices_cpu: [sum(Li)] tensor of flattened indices into the
+            runner's CPU token matrix (row-major) selecting the window tokens.
+          block_table: KV-group-0 BlockTable for block table tensors.
 
         Returns:
-          - Updated CommonAttentionMetadata with adjusted query_start_loc/seq_lens
-          - token_indices: indices into the flattened token buffer that represent
-            the reconstructed sequences to feed into the draft model.
+          CommonAttentionMetadata for the window (KV group 0).
         """
-        device = common_attn_metadata.query_start_loc.device
-        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
-        new_seq_lens_cpu = (
-            common_attn_metadata.seq_lens_cpu - num_rejected_tokens
+        assert isinstance(window_seq_lens_cpu, torch.Tensor)
+        assert isinstance(token_indices_cpu, torch.Tensor)
+
+        # Derive per-token request indices and positions within each request.
+        num_reqs = window_seq_lens_cpu.shape[0]
+        window_seq_lens_np = window_seq_lens_cpu.numpy().astype(np.int32, copy=False)
+
+        # print(f"[DEBUG] DraftModelProposer.prepare_inputs: num_reqs={num_reqs}, "
+        #       f"window_seq_lens={window_seq_lens_np}, "
+        #       f"token_indices_cpu.shape={token_indices_cpu.shape}")
+
+        # Build query_start_loc on CPU (pinned).
+        query_start_loc_cpu = torch.zeros(
+            (num_reqs + 1,), dtype=torch.int32, pin_memory=is_pin_memory_available()
+        )
+        qsl_np = query_start_loc_cpu.numpy()
+        np.cumsum(window_seq_lens_np, out=qsl_np[1:])
+        total_num_tokens = int(qsl_np[-1])
+
+        # print(f"[DEBUG] DraftModelProposer.prepare_inputs: total_num_tokens={total_num_tokens}, "
+        #       f"query_start_loc={qsl_np}")
+
+        # Per-token request index and per-token position within request.
+        req_indices_np = np.empty(total_num_tokens, dtype=np.int32)
+        positions_np = np.empty(total_num_tokens, dtype=np.int64)
+        for i in range(num_reqs):
+            Li = int(window_seq_lens_np[i])
+            if Li == 0:
+                continue
+            start = qsl_np[i]
+            end = qsl_np[i + 1]
+            req_indices_np[start:end] = i
+            # Positions within each request are [0..Li-1]
+            positions_np[start:end] = np.arange(Li, dtype=np.int64)
+
+        # Compute a dynamic slot mapping without using the BlockTable's fixed-size buffer.
+        # This mirrors BlockTable.compute_slot_mapping but writes into a per-window tensor.
+        block_size = block_table.block_size
+        max_blocks_per_req = block_table.max_num_blocks_per_req
+        block_table_np = block_table.block_table_np
+
+        block_table_indices = (
+            req_indices_np.astype(np.int64) * max_blocks_per_req
+            + (positions_np // block_size)
+        )
+        block_numbers = block_table_np.ravel()[block_table_indices]
+        block_offsets = positions_np % block_size
+        slot_mapping_np = block_numbers.astype(np.int64) * block_size + block_offsets
+        slot_mapping_gpu = torch.from_numpy(slot_mapping_np).to(
+            self.device, non_blocking=True
         )
 
-        # [0, q1, q1 + q2, ...] -> [q1, q2, ...]
-        new_query_len_per_req = (
-            query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
-        )
-        # [q1, q2, ...] -> [q1 - n1, q2 - n2, ...]
-        new_num_tokens_per_req = new_query_len_per_req - num_rejected_tokens
-        new_num_tokens_per_req_np = new_num_tokens_per_req.numpy()
-
-        # Build new query_start_loc on CPU (pinned)
-        new_query_start_loc_cpu = torch.zeros(
-            query_start_loc_cpu.shape,
-            dtype=torch.int32,
-            pin_memory=is_pin_memory_available(),
-        )
-        new_query_start_loc_np = new_query_start_loc_cpu.numpy()
-        np.cumsum(new_num_tokens_per_req_np, out=new_query_start_loc_np[1:])
-        total_num_tokens = int(new_query_start_loc_np[-1])
-
-        # Compute per-token offsets within each request segment: [0.., 0.., ...]
-        new_query_start_locs_expanded = np.repeat(
-            new_query_start_loc_np[:-1], new_num_tokens_per_req_np
-        )
-        token_offsets = (
-            self.token_arange_np[:total_num_tokens]
-            - new_query_start_locs_expanded
-        )
-
-        # Expand old starting locations to align with new per-request token counts
-        old_query_start_locs_expanded = np.repeat(
-            query_start_loc_cpu[:-1].numpy(), new_num_tokens_per_req_np
-        )
-
-        # Final flattened indices into the original token buffer
-        token_indices_np = token_offsets + old_query_start_locs_expanded
-        token_indices = torch.from_numpy(token_indices_np).to(
-            device, non_blocking=True
-        )
-
-        spec_common_attn_metadata = CommonAttentionMetadata(
-            query_start_loc=new_query_start_loc_cpu.to(
-                device, non_blocking=True
-            ),
-            seq_lens=new_seq_lens_cpu.to(device, non_blocking=True),
-            query_start_loc_cpu=new_query_start_loc_cpu,
-            seq_lens_cpu=new_seq_lens_cpu,
-            num_computed_tokens_cpu=common_attn_metadata.num_computed_tokens_cpu,
-            num_reqs=common_attn_metadata.num_reqs,
+        # Build CommonAttentionMetadata (KV group 0).
+        common_attn_metadata = CommonAttentionMetadata(
+            query_start_loc=query_start_loc_cpu.to(self.device, non_blocking=True),
+            query_start_loc_cpu=query_start_loc_cpu,
+            seq_lens=window_seq_lens_cpu.to(self.device, non_blocking=True),
+            seq_lens_cpu=window_seq_lens_cpu,
+            num_computed_tokens_cpu=window_seq_lens_cpu,
+            num_reqs=num_reqs,
             num_actual_tokens=total_num_tokens,
-            max_query_len=int(new_query_len_per_req.max().item()),
-            max_seq_len=int(new_seq_lens_cpu.max().item()),
-            block_table_tensor=common_attn_metadata.block_table_tensor,
-            slot_mapping=common_attn_metadata.slot_mapping[token_indices],
+            max_query_len=int(window_seq_lens_np.max(initial=0)),
+            max_seq_len=int(window_seq_lens_np.max(initial=0)),
+            block_table_tensor=block_table.get_device_tensor()[:num_reqs],
+            slot_mapping=slot_mapping_gpu,
             causal=True,
         )
+        # print(f"[DEBUG] DraftModelProposer.prepare_inputs: returning metadata with "
+        #       f"num_actual_tokens={common_attn_metadata.num_actual_tokens}")
+        return common_attn_metadata
 
-        return spec_common_attn_metadata, token_indices
+
 
     def load_model(self) -> None:
         from vllm.compilation.backends import set_model_tag
@@ -382,7 +453,7 @@ class DraftModelProposer:
             )
             if len(self.attn_layer_names) > 0:
                 first_layer = layers[self.attn_layer_names[0]]
-                attn_backend = first_layer.attn_backend
+                attn_backend = first_layer.get_attn_backend()
                 # Build KV cache spec based on the draft model config
                 draft_dtype = self.draft_model_config.dtype
                 if isinstance(draft_dtype, str):
@@ -399,7 +470,8 @@ class DraftModelProposer:
                     use_mla=self.draft_model_config.use_mla,
                     sliding_window=self.draft_model_config.get_sliding_window(),
                 )
-                builder_cls = attn_backend.get_builder_cls()
+                # generic type isn't propogating here?
+                builder_cls: Any = attn_backend.get_builder_cls()
                 self.draft_attn_metadata_builder = builder_cls(
                     kv_cache_spec=kv_cache_spec,
                     layer_names=self.attn_layer_names,

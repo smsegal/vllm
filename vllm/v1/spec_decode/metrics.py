@@ -80,10 +80,6 @@ class SpecDecodingLogging:
             else float("nan")
         )
 
-        pos_matrix = np.array(self.accepted_tokens_per_pos_lists)
-        acceptance_probs = np.sum(pos_matrix, axis=0) / num_drafts
-        probs_str = ", ".join(f"{p:.3f}" for p in acceptance_probs)
-
         # Conventionally, mean acceptance length includes the bonus token
         mean_acceptance_length = 1 + (num_accepted_tokens / num_drafts)
 
@@ -92,14 +88,11 @@ class SpecDecodingLogging:
             "Draft acceptance rate: %.1f%%, "
             "Mean acceptance length: %.2f, "
             "Accepted: %d tokens, "
-            "Drafted: %d tokens, "
-            "Per-position acceptance rate: %s",
-            "Per-position acceptance probabilities: %s",
+            "Drafted: %d tokens, ",
             draft_acceptance_rate,
             mean_acceptance_length,
             num_accepted_tokens,
             num_draft_tokens,
-            probs_str,
         )
         self.reset()
 
