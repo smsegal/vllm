@@ -2044,7 +2044,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 spec_decode_metadata,
                 spec_decode_common_attn_metadata,
             )
-            logger.info("DRAFTED %s ... ", self._draft_token_ids)
 
         self.eplb_step()
 
@@ -2237,6 +2236,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 common_attn_metadata=common_attn_metadata,
                 mm_embeds=mm_embeds,
             )
+            spec_token_ids = draft_token_ids.tolist()
         return spec_token_ids
 
     def propose_ngram_draft_token_ids(
