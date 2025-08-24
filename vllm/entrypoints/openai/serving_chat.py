@@ -1515,6 +1515,29 @@ class OpenAIServingChat(OpenAIServing):
 
         request_metadata.final_usage_info = usage
 
+        # Detect a long run of zeros at the end of acceptance_lengths
+        # or a high overall proportion of zeros (>20%).
+        acc = final_res.acceptance_lengths or []
+        long_zero_run = False
+        if acc:
+            n = len(acc)
+            # longest zero suffix (contiguous zeros at the end)
+            suffix_zeros = 0
+            for v in reversed(acc):
+                if v == 0:
+                    suffix_zeros += 1
+                else:
+                    break
+            # proportion thresholds
+            zero_suffix_ratio = suffix_zeros / n
+            total_zero_ratio = sum(1 for v in acc if v == 0) / n
+            # Define long_zero_run as either a long suffix towards the end
+            # or generally many zeros overall.
+            long_zero_run = (
+                zero_suffix_ratio >= 0.2
+                or total_zero_ratio >= 0.75
+            )
+
         response = ChatCompletionResponse(
             id=request_id,
             created=created_time,

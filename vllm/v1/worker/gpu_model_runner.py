@@ -2133,15 +2133,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             # Compute per-request lengths and cumulative sums on CPU.
             num_reqs = self.input_batch.num_reqs
-
-            # For each request i, seq_len_i = num_computed_tokens + num_scheduled_tokens
-            # We will use the entire available context for window Li = seq_len_i.
-            seq_len_cpu = (
-                self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs]
-                + torch.tensor([scheduler_output.num_scheduled_tokens[req_id] for req_id in req_ids_for_batch],
-                               dtype=torch.int32, device=self.input_batch.num_computed_tokens_cpu_tensor.device)
-            )
-            seq_len_np = seq_len_cpu.cpu().numpy().astype(np.int32, copy=False)
+            # Use the actual number of generated tokens for each request to build
+            # the context window. ``req_state.num_tokens`` reflects only the
+            # tokens that have been accepted and stored in the CPU token buffer,
+            # excluding any speculative tokens that were rejected in the
+            # previous step. This prevents stale draft tokens from polluting the
+            # context and degrading future acceptance lengths.
+            seq_lens = [self.requests[req_id].num_tokens for req_id in req_ids_for_batch]
+            seq_len_cpu = torch.tensor(seq_lens, dtype=torch.int32, device="cpu", pin_memory=True)
+            seq_len_np = seq_len_cpu.numpy().astype(np.int32, copy=False)
 
             # Build query_start_loc for the draft window: cumulative sum of Li.
             draft_query_start_loc_cpu = torch.zeros(
