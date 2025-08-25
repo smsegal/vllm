@@ -2134,14 +2134,25 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # Compute per-request lengths and cumulative sums on CPU.
             num_reqs = self.input_batch.num_reqs
 
-            # For each request i, seq_len_i = num_computed_tokens + num_scheduled_tokens
-            # We will use the entire available context for window Li = seq_len_i.
-            seq_len_cpu = (
-                self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs]
-                + torch.tensor([scheduler_output.num_scheduled_tokens[req_id] for req_id in req_ids_for_batch],
-                               dtype=torch.int32, device=self.input_batch.num_computed_tokens_cpu_tensor.device)
+            # Use the true committed sequence lengths for each request.  The
+            # previous implementation derived the window length from
+            # ``num_computed_tokens + num_scheduled_tokens`` which counted draft
+            # tokens that may later be rejected by the target model.  As the
+            # sequence progressed this caused increasingly stale tokens to be
+            # included in the draft context, eventually degrading acceptance
+            # length to zero.  Instead, base the window on
+            # ``num_tokens_no_spec`` which tracks only tokens that are actually
+            # part of the request's sequence.
+            seq_len_np = self.input_batch.num_tokens_no_spec[:num_reqs].astype(
+                np.int32,
+                copy=False,
             )
-            seq_len_np = seq_len_cpu.cpu().numpy().astype(np.int32, copy=False)
+            seq_len_cpu = torch.tensor(
+                seq_len_np,
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=True,
+            )
 
             # Build query_start_loc for the draft window: cumulative sum of Li.
             draft_query_start_loc_cpu = torch.zeros(
@@ -2152,9 +2163,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             total_draft_tokens = int(draft_qsl_np[-1])
 
             # DEBUG: Print draft window stats
-            print(f"[DEBUG] Draft window: total_draft_tokens={total_draft_tokens}, "
-                  f"max_num_tokens={self.max_num_tokens}, "
-                  f"num_reqs={num_reqs}, seq_lens={seq_len_np}")
+            # print(
+            #     f"[DEBUG] Draft window: total_draft_tokens={total_draft_tokens}, "
+            #     f"max_num_tokens={self.max_num_tokens}, num_reqs={num_reqs}, seq_lens={seq_len_np}"
+            # )
 
             # Allocate CPU staging buffers for gather (pinned for faster H2D).
             gather_indices = torch.empty((total_draft_tokens,),
